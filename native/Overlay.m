@@ -61,6 +61,7 @@ static NSDictionary *FKCall(NSDictionary *request) {
 @property(nonatomic, copy) NSString *shape;
 @property(nonatomic) BOOL engineReady;
 @property(nonatomic) CGPoint dragOrigin;
+@property(nonatomic) NSUInteger overlayAttempts;
 @end
 
 @implementation FKController
@@ -97,7 +98,14 @@ static NSDictionary *FKCall(NSDictionary *request) {
 }
 - (void)showOverlay {
     UIWindow *window = self.webView.window;
-    if (!window || self.floatingButton) return;
+    if (self.floatingButton) return;
+    if (!window) {
+        if (self.webView && self.overlayAttempts++ < 40) {
+            __weak FKController *weakSelf = self;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [weakSelf showOverlay]; });
+        }
+        return;
+    }
     self.floatingButton = [UIButton buttonWithType:UIButtonTypeCustom];
     self.floatingButton.frame = CGRectMake(24, 100, 50, 50);
     self.floatingButton.layer.cornerRadius = 25; self.floatingButton.clipsToBounds = YES;
