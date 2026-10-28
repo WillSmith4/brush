@@ -314,17 +314,19 @@ static void FKSchemeStop(id self, SEL selector, WKWebView *view, id<WKURLSchemeT
     if (objc_getAssociatedObject(task, &FKServedTaskKey)) return;
     ((void (*)(id, SEL, WKWebView *, id<WKURLSchemeTask>))originalSchemeStop)(self, selector, view, task);
 }
-__attribute__((constructor)) static void FKInstall(void) {
-    dispatch_async(dispatch_get_main_queue(), ^{
+static void FKInstallMethods(void) {
         Class cls = NSClassFromString(@"FeatherPro.FullScreenWebView");
         Method method = cls ? class_getInstanceMethod(cls, @selector(initWithFrame:configuration:)) : NULL;
-        if (method) originalInit = method_setImplementation(method, (IMP)FKWebViewInit);
+        if (method && !originalInit) originalInit = method_setImplementation(method, (IMP)FKWebViewInit);
         Class proxy = NSClassFromString(@"FeatherPro.FeatherProxy");
         Method start = proxy ? class_getInstanceMethod(proxy, @selector(webView:startURLSchemeTask:)) : NULL;
         Method stop = proxy ? class_getInstanceMethod(proxy, @selector(webView:stopURLSchemeTask:)) : NULL;
-        if (start && stop) {
+        if (start && stop && !originalSchemeStart) {
             originalSchemeStart = method_setImplementation(start, (IMP)FKSchemeStart);
             originalSchemeStop = method_setImplementation(stop, (IMP)FKSchemeStop);
         }
-    });
+}
+__attribute__((constructor)) static void FKInstall(void) {
+    @autoreleasepool { FKInstallMethods(); }
+    dispatch_async(dispatch_get_main_queue(), ^{ FKInstallMethods(); });
 }
