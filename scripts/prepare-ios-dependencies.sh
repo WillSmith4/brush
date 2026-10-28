@@ -18,7 +18,7 @@ test "$(xcrun --sdk iphoneos --show-sdk-version)" = '26.5'
 
 # Evaluate one source-independent profile for the entire dependency build.
 cd upstream
-nix develop --profile "$RUNNER_TEMP/brush-ios-profile" \
+nix develop --print-build-logs --profile "$RUNNER_TEMP/brush-ios-profile" \
   .#librepaint-ios-incremental-env \
   --command bash -c 'cmake --version; ninja --version; xcrun --sdk iphoneos clang++ --version' \
   2>&1 | tee ../artifacts/dependencies.log
