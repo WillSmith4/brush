@@ -32,6 +32,7 @@
 #include <KisResourceLoader.h>
 #include <KisResourceLoaderRegistry.h>
 #include <KisResourceLocator.h>
+#include <KisResourceModel.h>
 #include <KisResourceStorage.h>
 #include <KisResourceTypes.h>
 #include <kis_brush_registry.h>
@@ -154,9 +155,11 @@ QJsonObject importPresets(const QJsonObject &request) {
         auto *registry = KisResourceLoaderRegistry::instance();
         const QString mime = KisMimeDatabase::mimeTypeForFile(path);
         if (registry->loader(ResourceType::PaintOpPresets, mime)) {
-            appendPreset(result, KisResourceLocator::instance()->importResourceFromFile(ResourceType::PaintOpPresets, path, false), path);
+            KisResourceModel model(ResourceType::PaintOpPresets);
+            appendPreset(result, model.importResourceFile(path, false), path);
         } else if (registry->loader(ResourceType::Brushes, mime)) {
-            appendBrushTip(result, KisResourceLocator::instance()->importResourceFromFile(ResourceType::Brushes, path, false), path);
+            KisResourceModel model(ResourceType::Brushes);
+            appendBrushTip(result, model.importResourceFile(path, false), path);
         }
     }
     require(!result.isEmpty(), "Krita found no supported brush presets or brush tips in this file.");

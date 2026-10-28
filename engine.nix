@@ -14,6 +14,13 @@ in original.overrideAttrs (old: {
     ninja -n FeatherKritaEngine > engine-build-plan.txt
     printf 'Native engine build command count: '
     wc -l < engine-build-plan.txt
+    # Compile the adapter first so interface errors do not wait for all libraries.
+    ninja feather-native/CMakeFiles/FeatherKritaEngine.dir/KritaBridge.cpp.o
+  '';
+  buildPhase = ''
+    runHook preBuild
+    cmake --build . --target FeatherKritaEngine --parallel "$NIX_BUILD_CORES"
+    runHook postBuild
   '';
   doInstallCheck = false;
   preInstall = "";

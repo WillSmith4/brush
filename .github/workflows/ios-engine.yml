@@ -29,7 +29,12 @@ jobs:
       - name: Restore pinned iOS build environment
         run: bash scripts/prepare-ios-dependencies.sh
       - name: Compile native brush engine
-        run: bash scripts/build-engine.sh 2>&1 | tee artifacts/engine-build.log
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/build-engine.sh 2>&1 | tee artifacts/engine-build.log
+          test -s artifacts/FeatherKritaEngine.dylib
+          test -s artifacts/FeatherKritaEngine-resources.tar.gz
       - name: Preserve build outputs and diagnostics
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
