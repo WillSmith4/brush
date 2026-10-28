@@ -16,6 +16,20 @@ xcode_description="$(xcodebuild -version)"
 test "${xcode_description%%$'\n'*}" = 'Xcode 26.6'
 test "$(xcrun --sdk iphoneos --show-sdk-version)" = '26.5'
 
+# GitHub's Xcode.app is a symlink. Declare its canonical destination so the
+# Darwin sandbox grants access to the same pinned Xcode installation.
+python3 - <<'PY'
+from pathlib import Path
+import json
+p = Path('upstream/nix/ios/toolchain.nix')
+original = 'xcodeApp = "/Applications/Xcode.app";'
+text = p.read_text()
+assert text.count(original) == 1
+actual = str(Path('/Applications/Xcode.app').resolve())
+assert actual == '/Applications/Xcode_26.6.app', actual
+p.write_text(text.replace(original, 'xcodeApp = ' + json.dumps(actual) + ';'))
+PY
+
 # Evaluate one source-independent profile for the entire dependency build.
 cd upstream
 nix develop --print-build-logs --profile "$RUNNER_TEMP/brush-ios-profile" \
