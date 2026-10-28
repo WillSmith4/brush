@@ -3,6 +3,7 @@
 add_library(FeatherKritaEngine SHARED KritaBridge.cpp)
 target_compile_features(FeatherKritaEngine PRIVATE cxx_std_17)
 set_target_properties(FeatherKritaEngine PROPERTIES
+    AUTOMOC OFF AUTOUIC OFF
     PREFIX "" OUTPUT_NAME "FeatherKritaEngine"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
     CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN YES
