@@ -8,10 +8,13 @@ const tick = () => new Promise(resolve=>setImmediate(resolve));
 
 function fixture() {
   const errors=[];
+  const requests=[];
   const context = {console, document:{readyState:'complete'},setTimeout,clearTimeout,queueMicrotask,
     Image:class {async decode(){}}, CustomEvent:class {}, dispatchEvent(){},
     webkit:{messageHandlers:{FeatherKrita:{async postMessage(body){
+      requests.push(body);
       if(body.command==='error')errors.push(body.message);
+      if(body.command==='selectPreset')return {ok:true,bindings:{RECT:'saved-native-preset'}};
       return body.command==='render'?{ok:true,width:body.width,height:body.height,png:'fixture'}:{ok:true};
     }}}}};
   vm.createContext(context);vm.runInContext(runtime,context);
@@ -35,7 +38,7 @@ function fixture() {
   const mesh=new THREE.Mesh(geometry,material);manager.sceneGroup.add(mesh);manager.geom={geometry,mesh};
   manager.curveIdToGeomInfo.set('curve',{numOfPoints:3,geomAttributes:0,geomIndex:0,
     attributes:{shape:'RECT',size:1,color:[50,100,200,0.5],pressures:[1,.5,1],points:[{x:0,y:0,z:0},{x:1,y:0,z:0},{x:2,y:1,z:0}]}});
-  return {context,manager,geometry,position,errors};
+  return {context,manager,geometry,position,errors,requests};
 }
 
 test('inject keeps original geometry and indices; restore removes the replacement',async()=>{
@@ -77,4 +80,14 @@ test('visibility changes and timelapse also constrain replacement geometry',asyn
   manager.turnOnOff(false);assert.equal(replacement.geometry.drawRange.count,0);
   manager.turnOnOff(true);assert.equal(replacement.geometry.drawRange.count,60);
   manager.timelapse(24);assert.equal(replacement.geometry.drawRange.count,24);
+});
+
+test('saving and recalling a host preset restores its native brush binding',async()=>{
+  const {context,manager,requests}=fixture();
+  context.FeatherKrita.savePreset('host-preset','RECT');
+  await context.FeatherKrita.selectPreset('host-preset','RECT');
+  manager.makeCurves();await tick();await tick();
+  assert.equal(requests.find(r=>r.command==='savePreset').id,'host-preset');
+  assert.equal(requests.find(r=>r.command==='render').preset,'saved-native-preset');
+  assert.equal(manager.sceneGroup.children.length,2);
 });

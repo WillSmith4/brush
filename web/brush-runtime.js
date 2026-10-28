@@ -5,6 +5,7 @@
   const SHAPES = ["POINTY", "RECT", "CUBE", "MARKER", "WIDEBRUSH", "RIBBON"];
   let bindings = Object.create(null), api, attached = false;
   const managers = new Set(), states = new WeakMap();
+  const latestAttributes = new WeakMap();
   const cache = new Map(), queue = [];
   let running = false, memory = 0;
   const MAX_TEXTURE_BYTES = 64 * 1024 * 1024;
@@ -143,7 +144,7 @@
       material.defines = {...original.defines}; material.userData.fkDefines = defines; material.needsUpdate = true;
     }
   }
-  function replaceCurve(manager, state, id, info, request, entry) {
+  function replaceCurve(manager, state, id, info, request, entry, attributes = info.attributes) {
     const geom = manager.getGeomFromInfo(info);
     if (!geom?.geometry?.index || !entry.texture) return;
     const source = geom.geometry;
@@ -173,7 +174,7 @@
       uv[(i * 4 + side) * 2 + 1] = request.v[(side === 0 || side === 3) ? 0 : 1];
     }
     geometry.setAttribute("fkUV", new api.Attribute(uv, 2)); geometry.computeBoundingSphere();
-    const material = materialFor(geom.mesh.material, entry.texture, info.attributes.color);
+    const material = materialFor(geom.mesh.material, entry.texture, attributes.color);
     const mesh = new api.Mesh(geometry, material);
     mesh.castShadow = geom.mesh.castShadow; mesh.receiveShadow = geom.mesh.receiveShadow;
     mesh.renderOrder = geom.mesh.renderOrder; mesh.matrixAutoUpdate = false;
@@ -203,16 +204,17 @@
     clearState(state);
     const generation = state.generation;
     for (const [id, info] of manager.curveIdToGeomInfo) {
-      const preset = bindings[info.attributes.shape];
+      const attributes = latestAttributes.get(info) || info.attributes;
+      const preset = bindings[attributes.shape];
       if (!preset) continue;
       let request;
-      try { request = strokeRequest(info.attributes, preset, api.fallbackSize); }
+      try { request = strokeRequest(attributes, preset, api.fallbackSize); }
       catch (error) { fail(error); continue; }
-      const active = () => generation === state.generation && bindings[info.attributes.shape] === preset && manager.curveIdToGeomInfo.get(id) === info;
+      const active = () => generation === state.generation && bindings[attributes.shape] === preset && manager.curveIdToGeomInfo.get(id) === info;
       textureFor(request.body, active).then((entry) => {
         if (!entry) return;
-        if (generation !== state.generation || bindings[info.attributes.shape] !== preset || manager.curveIdToGeomInfo.get(id) !== info) return;
-        try { replaceCurve(manager, state, id, info, request, entry); }
+        if (!active()) return;
+        try { replaceCurve(manager, state, id, info, request, entry, attributes); }
         catch (error) { fail(error); }
       }, fail);
     }
@@ -233,7 +235,12 @@
       Manager.prototype[name] = function (...args) {
         const state = register(this);
         if (state.depth++ === 0) { clearState(state); }
-        try { return original.apply(this, args); }
+        try {
+          const result = original.apply(this, args);
+          if (name === "makeCurve" && this.curveIdToGeomInfo.has(args[0])) latestAttributes.set(this.curveIdToGeomInfo.get(args[0]), args[1]);
+          if (name === "updateCurve" && args[0] && args[1]) latestAttributes.set(args[0], args[1]);
+          return result;
+        }
         finally {
           state.depth--;
           if (!state.depth) {
@@ -308,6 +315,13 @@
       synchronize(holder.manager);
     }, 90);
   }
-  root.FeatherKrita = {attach, setBindings, preview};
+  function savePreset(id, shape) { post({command:"savePreset",id,shape}).catch(fail); }
+  async function selectPreset(id, shape) {
+    try {
+      const result = await post({command:"selectPreset",id,shape});
+      if (result?.ok && result.bindings) setBindings(result.bindings);
+    } catch (error) { fail(error); }
+  }
+  root.FeatherKrita = {attach, setBindings, preview, savePreset, selectPreset};
   if (typeof module !== "undefined") module.exports = {strokeRequest, SHAPES};
 })(globalThis);

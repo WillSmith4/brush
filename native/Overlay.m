@@ -6,6 +6,7 @@
 #include <dlfcn.h>
 
 static NSString *const FKBindingsKey = @"FeatherKrita.bindings.v1";
+static NSString *const FKPresetBindingsKey = @"FeatherKrita.presetBindings.v1";
 static char FKControllerKey;
 static char FKRouterKey;
 static char FKServedTaskKey;
@@ -235,6 +236,22 @@ static NSDictionary *FKCall(NSDictionary *request) {
         [self showOverlay];
         if (self.bindings.count && [self initializeEngine]) [self publishBindings];
         reply(@{@"ok": @YES}, nil);
+    } else if ([command isEqualToString:@"savePreset"] || [command isEqualToString:@"selectPreset"]) {
+        NSString *identifier = body[@"id"], *shape = body[@"shape"];
+        if (![identifier isKindOfClass:NSString.class] || identifier.length > 128 || ![FKShapes() containsObject:shape]) { reply(nil, @"Invalid preset binding."); return; }
+        NSMutableDictionary *saved = [[NSUserDefaults.standardUserDefaults dictionaryForKey:FKPresetBindingsKey] mutableCopy] ?: NSMutableDictionary.dictionary;
+        if ([command isEqualToString:@"savePreset"]) {
+            saved[identifier] = @{@"shape": shape, @"preset": self.bindings[shape] ?: @""};
+            [NSUserDefaults.standardUserDefaults setObject:saved forKey:FKPresetBindingsKey];
+        } else if (saved[identifier]) {
+            NSString *preset = saved[identifier][@"preset"];
+            if (preset.length) {
+                if (![self initializeEngine] || !self.presets[preset]) { reply(nil, @"The brush resource for this preset is unavailable."); return; }
+                self.bindings[shape] = preset;
+            } else [self.bindings removeObjectForKey:shape];
+            [self publishBindings];
+        }
+        reply(@{@"ok": @YES, @"bindings": self.bindings}, nil);
     } else if ([command isEqualToString:@"error"]) {
         if ([body[@"message"] isKindOfClass:NSString.class]) self.statusLabel.text = body[@"message"];
         reply(@{@"ok": @YES}, nil);
