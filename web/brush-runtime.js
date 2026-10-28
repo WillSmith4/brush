@@ -111,7 +111,7 @@
     for (const record of state.records.values()) dispose(record);
     state.records.clear(); state.generation++;
   }
-  function materialFor(original, texture) {
+  function materialFor(original, texture, baseColor) {
     const material = new api.ShaderMaterial();
     material.copy(original);
     for (const flag of ["isCurveMaterial", "isCutoutMaterial", "isSelectionMaterial"]) {
@@ -122,10 +122,14 @@
       /void\s+main\s*\(\s*\)\s*\{/, "$&\n fkTexCoord = fkUV;");
     const match = "vec4 diffuseColor = vColor;";
     if (!original.fragmentShader.includes(match)) throw new Error("Unsupported Feather stroke material.");
-    material.fragmentShader = declaration + "uniform sampler2D fkBrush;\n" + original.fragmentShader.replace(match,
+    material.fragmentShader = declaration + "uniform sampler2D fkBrush;\nuniform vec4 fkBaseColor;\n" + original.fragmentShader.replace(match,
       "vec4 fkSample = texture2D(fkBrush, fkTexCoord);\n" +
-      "if (fkSample.a < 0.004) discard;\nvec4 diffuseColor = fkSample;");
+      "if (fkSample.a < 0.004) discard;\n" +
+      "fkSample.rgb = clamp(fkSample.rgb + vColor.rgb - fkBaseColor.rgb, 0.0, 1.0);\n" +
+      "fkSample.a *= fkBaseColor.a > 0.0001 ? vColor.a / fkBaseColor.a : 0.0;\n" +
+      "vec4 diffuseColor = fkSample;");
     material.uniforms.fkBrush = {value: texture};
+    material.uniforms.fkBaseColor = {value: [baseColor[0] / 255, baseColor[1] / 255, baseColor[2] / 255, baseColor[3] ?? 1]};
     material.transparent = true;
     material.needsUpdate = true;
     return material;
@@ -169,7 +173,7 @@
       uv[(i * 4 + side) * 2 + 1] = request.v[(side === 0 || side === 3) ? 0 : 1];
     }
     geometry.setAttribute("fkUV", new api.Attribute(uv, 2)); geometry.computeBoundingSphere();
-    const material = materialFor(geom.mesh.material, entry.texture);
+    const material = materialFor(geom.mesh.material, entry.texture, info.attributes.color);
     const mesh = new api.Mesh(geometry, material);
     mesh.castShadow = geom.mesh.castShadow; mesh.receiveShadow = geom.mesh.receiveShadow;
     mesh.renderOrder = geom.mesh.renderOrder; mesh.matrixAutoUpdate = false;
