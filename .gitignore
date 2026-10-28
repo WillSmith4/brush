@@ -1,0 +1,9 @@
+upstream/
+build/
+artifacts/
+.profiles/
+result*
+*.ipa
+*.app/
+*.dylib
+

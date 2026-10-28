@@ -1,0 +1,38 @@
+name: Native Krita iOS dependencies
+on:
+  push:
+    paths:
+      - '.github/workflows/ios-dependencies.yml'
+      - 'scripts/prepare-ios-dependencies.sh'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: native-krita-ios-dependencies
+  cancel-in-progress: false
+jobs:
+  dependencies:
+    runs-on: macos-26
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            sandbox = true
+            sandbox-fallback = false
+            allowed-impure-host-deps = /Applications/Xcode.app
+            max-jobs = 2
+            cores = 2
+      - uses: DeterminateSystems/magic-nix-cache-action@565684385bcd71bad329742eefe8d12f2e765b39
+      - name: Build pinned iOS dependency environment
+        run: bash scripts/prepare-ios-dependencies.sh
+      - name: Preserve diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ios-dependency-diagnostics
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
