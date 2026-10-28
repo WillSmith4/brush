@@ -22,7 +22,7 @@ jobs:
             experimental-features = nix-command flakes
             sandbox = true
             sandbox-fallback = false
-            allowed-impure-host-deps = /Applications/Xcode.app
+            extra-allowed-impure-host-deps = /Applications/Xcode.app
             max-jobs = 2
             cores = 2
       - uses: DeterminateSystems/magic-nix-cache-action@565684385bcd71bad329742eefe8d12f2e765b39

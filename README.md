@@ -14,4 +14,3 @@ are not build inputs to this repository. Final application packaging is local.
 
 LibrePaint and its dependencies retain their upstream licenses. Integration
 source derived from LibrePaint will retain its SPDX notices and compatible license.
-

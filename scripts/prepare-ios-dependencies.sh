@@ -23,4 +23,3 @@ nix develop --profile "$RUNNER_TEMP/brush-ios-profile" \
   2>&1 | tee ../artifacts/dependencies.log
 printf '%s\n' "$revision" > ../artifacts/upstream-revision.txt
 nix-store --query --requisites "$RUNNER_TEMP/brush-ios-profile" > ../artifacts/dependency-paths.txt
-
