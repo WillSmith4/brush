@@ -22,12 +22,12 @@ python3 - <<'PY'
 from pathlib import Path
 import json
 p = Path('upstream/nix/ios/toolchain.nix')
-original = 'xcodeApp = "/Applications/Xcode.app";'
+original = 'impureHostDeps = [\n    xcodeApp\n  ];'
 text = p.read_text()
 assert text.count(original) == 1
 actual = str(Path('/Applications/Xcode.app').resolve())
 assert actual == '/Applications/Xcode_26.6.app', actual
-p.write_text(text.replace(original, 'xcodeApp = ' + json.dumps(actual) + ';'))
+p.write_text(text.replace(original, 'impureHostDeps = [\n    xcodeApp\n    ' + json.dumps(actual) + '\n  ];'))
 PY
 
 # Evaluate one source-independent profile for the entire dependency build.
