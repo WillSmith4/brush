@@ -156,10 +156,10 @@ QJsonObject importPresets(const QJsonObject &request) {
         const QString mime = KisMimeDatabase::mimeTypeForFile(path);
         if (registry->loader(ResourceType::PaintOpPresets, mime)) {
             KisResourceModel model(ResourceType::PaintOpPresets);
-            appendPreset(result, model.importResourceFile(path, false), path);
+            appendPreset(result, model.importResourceFile(path, true), path);
         } else if (registry->loader(ResourceType::Brushes, mime)) {
             KisResourceModel model(ResourceType::Brushes);
-            appendBrushTip(result, model.importResourceFile(path, false), path);
+            appendBrushTip(result, model.importResourceFile(path, true), path);
         }
     }
     require(!result.isEmpty(), "Krita found no supported brush presets or brush tips in this file.");
