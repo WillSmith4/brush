@@ -8,6 +8,7 @@
 static NSString *const FKBindingsKey = @"FeatherKrita.bindings.v1";
 static char FKControllerKey;
 static char FKRouterKey;
+static char FKServedTaskKey;
 static NSArray<NSString *> *FKShapes(void) {
     return @[@"POINTY", @"RECT", @"CUBE", @"MARKER", @"WIDEBRUSH", @"RIBBON"];
 }
@@ -28,8 +29,9 @@ static NSDictionary *FKCall(NSDictionary *request) {
         NSString *path = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"Frameworks/FeatherKritaEngine.dylib"];
         library = dlopen(path.fileSystemRepresentation, RTLD_NOW | RTLD_LOCAL);
         if (!library) return @{@"ok": @NO, @"error": [NSString stringWithUTF8String:dlerror()] ?: @"Cannot load the brush engine."};
-        call = dlsym(library, "FKRequest"); releaseResponse = dlsym(library, "FKFreeResponse");
-        if (!call || !releaseResponse) return @{@"ok": @NO, @"error": @"The brush engine API is incomplete."};
+        void *requestFunction = dlsym(library, "FKRequest"), *freeFunction = dlsym(library, "FKFreeResponse");
+        if (!requestFunction || !freeFunction) { dlclose(library); library = NULL; return @{@"ok": @NO, @"error": @"The brush engine API is incomplete."}; }
+        call = requestFunction; releaseResponse = freeFunction;
     }
     NSError *error;
     NSData *data = [NSJSONSerialization dataWithJSONObject:request options:0 error:&error];
@@ -262,16 +264,50 @@ static id FKWebViewInit(id object, SEL selector, CGRect frame, WKWebViewConfigur
         FKMessageRouter *router = [FKMessageRouter new];
         [configuration.userContentController addScriptMessageHandlerWithReply:router contentWorld:WKContentWorld.pageWorld name:@"FeatherKrita"];
         objc_setAssociatedObject(configuration.userContentController, &FKRouterKey, router, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        NSString *runtime = [NSString stringWithContentsOfFile:[NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"FeatherKrita/brush-runtime.js"] encoding:NSUTF8StringEncoding error:nil];
+        if (runtime) {
+            NSString *guarded = [NSString stringWithFormat:@"if(location.protocol==='local:'&&location.hostname==='app'&&location.pathname.startsWith('/note')){%@}", runtime];
+            WKUserScript *script = [[WKUserScript alloc] initWithSource:guarded injectionTime:WKUserScriptInjectionTimeAtDocumentStart forMainFrameOnly:YES];
+            [configuration.userContentController addUserScript:script];
+        }
     }
     WKWebView *view = ((id (*)(id, SEL, CGRect, WKWebViewConfiguration *))originalInit)(object, selector, frame, configuration);
     controller.webView = view;
     objc_setAssociatedObject(view, &FKControllerKey, controller, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     return view;
 }
+static IMP originalSchemeStart, originalSchemeStop;
+static void FKSchemeStart(id self, SEL selector, WKWebView *view, id<WKURLSchemeTask> task) {
+    NSURL *url = task.request.URL;
+    // Match the verified 1.3.4 resource exactly, including when its original
+    // copy is already cached in the application's data container.
+    if ([url.scheme isEqualToString:@"local"] && [url.host isEqualToString:@"app"] &&
+        [url.path isEqualToString:@"/note/index.06462505d18f794acb5e90e3bd0b9ae4.js"]) {
+        NSString *path = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"FeatherKrita/note.patched.js"];
+        NSData *data = [NSData dataWithContentsOfFile:path];
+        if (data) {
+            objc_setAssociatedObject(task, &FKServedTaskKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            NSURLResponse *response = [[NSURLResponse alloc] initWithURL:url MIMEType:@"application/javascript" expectedContentLength:data.length textEncodingName:@"utf-8"];
+            [task didReceiveResponse:response]; [task didReceiveData:data]; [task didFinish]; return;
+        }
+    }
+    ((void (*)(id, SEL, WKWebView *, id<WKURLSchemeTask>))originalSchemeStart)(self, selector, view, task);
+}
+static void FKSchemeStop(id self, SEL selector, WKWebView *view, id<WKURLSchemeTask> task) {
+    if (objc_getAssociatedObject(task, &FKServedTaskKey)) return;
+    ((void (*)(id, SEL, WKWebView *, id<WKURLSchemeTask>))originalSchemeStop)(self, selector, view, task);
+}
 __attribute__((constructor)) static void FKInstall(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         Class cls = NSClassFromString(@"FeatherPro.FullScreenWebView");
         Method method = cls ? class_getInstanceMethod(cls, @selector(initWithFrame:configuration:)) : NULL;
         if (method) originalInit = method_setImplementation(method, (IMP)FKWebViewInit);
+        Class proxy = NSClassFromString(@"FeatherPro.FeatherProxy");
+        Method start = proxy ? class_getInstanceMethod(proxy, @selector(webView:startURLSchemeTask:)) : NULL;
+        Method stop = proxy ? class_getInstanceMethod(proxy, @selector(webView:stopURLSchemeTask:)) : NULL;
+        if (start && stop) {
+            originalSchemeStart = method_setImplementation(start, (IMP)FKSchemeStart);
+            originalSchemeStop = method_setImplementation(stop, (IMP)FKSchemeStop);
+        }
     });
 }

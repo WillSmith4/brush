@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 (function (root) {
   "use strict";
+  if (root.FeatherKrita) return;
   const SHAPES = ["POINTY", "RECT", "CUBE", "MARKER", "WIDEBRUSH", "RIBBON"];
   let bindings = Object.create(null), api, attached = false;
   const managers = new Set(), states = new WeakMap();
@@ -58,6 +59,9 @@
       while (queue.length) {
         const job = queue.shift();
         try {
+          if (!job.entry.active.some(check => check())) {
+            cache.delete(job.key); job.resolve(null); continue;
+          }
           const result = await post(job.body);
           if (!result?.ok) throw new Error(result?.error || "Native stroke rendering failed.");
           const image = new Image();
@@ -79,12 +83,12 @@
       }
     } finally { running = false; }
   }
-  function textureFor(body) {
+  function textureFor(body, active) {
     const key = JSON.stringify(body);
     let entry = cache.get(key);
-    if (entry) return entry.promise;
-    entry = {refs: 0, texture: null, bytes: 0};
-    entry.promise = new Promise((resolve, reject) => queue.push({key, body, resolve, reject}));
+    if (entry) { if (!entry.texture) entry.active.push(active); return entry.promise; }
+    entry = {refs: 0, texture: null, bytes: 0, active: [active]};
+    entry.promise = new Promise((resolve, reject) => queue.push({key, body, resolve, reject, entry}));
     cache.set(key, entry); pump();
     return entry.promise;
   }
@@ -169,14 +173,22 @@
     mesh.matrix.copy(geom.mesh.matrix);
     mesh.onBeforeRender = () => {
       syncUniforms(geom.mesh.material, material, entry.texture);
-      mesh.visible = geom.mesh.visible;
       mesh.matrix.copy(geom.mesh.matrix); mesh.matrixWorldNeedsUpdate = true;
     };
+    const syncVisibility = () => {
+      mesh.visible = geom.mesh.visible;
+      const start = source.drawRange.start, end = start + source.drawRange.count;
+      const first = Math.max(0, start - info.geomIndex);
+      const last = Math.min(indexCount, end - info.geomIndex);
+      mesh.geometry.setDrawRange(first, Math.max(0, last - first));
+    };
+    syncVisibility();
     manager.sceneGroup.add(mesh);
     const hideArray = source.attributes.fkHide.array;
     hideArray.fill(1, info.geomAttributes, info.geomAttributes + count);
     source.attributes.fkHide.needsUpdate = true; entry.refs++;
-    state.records.set(id, {mesh, entry, source, hideArray, vertexOffset: info.geomAttributes, vertexCount: count, hidden: true});
+    state.records.set(id, {mesh, entry, source, hideArray, syncVisibility, vertexOffset: info.geomAttributes, vertexCount: count, hidden: true});
+    api.redraw?.();
   }
   function synchronize(manager) {
     const state = states.get(manager);
@@ -189,7 +201,9 @@
       let request;
       try { request = strokeRequest(info.attributes, preset, api.fallbackSize); }
       catch (error) { fail(error); continue; }
-      textureFor(request.body).then((entry) => {
+      const active = () => generation === state.generation && bindings[info.attributes.shape] === preset && manager.curveIdToGeomInfo.get(id) === info;
+      textureFor(request.body, active).then((entry) => {
+        if (!entry) return;
         if (generation !== state.generation || bindings[info.attributes.shape] !== preset || manager.curveIdToGeomInfo.get(id) !== info) return;
         try { replaceCurve(manager, state, id, info, request, entry); }
         catch (error) { fail(error); }
@@ -222,6 +236,15 @@
         }
       };
     }
+    for (const name of ["turnOnOff", "timelapse"]) {
+      const original = Manager.prototype[name];
+      if (typeof original !== "function") continue;
+      Manager.prototype[name] = function (...args) {
+        const result = original.apply(this, args);
+        for (const record of states.get(this)?.records.values() || []) record.syncVisibility();
+        return result;
+      };
+    }
     const ready = () => post({command: "ready"}).catch(fail);
     if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", () => setTimeout(ready, 250), {once: true});
     else setTimeout(ready, 250);
@@ -229,6 +252,7 @@
   function setBindings(next) {
     bindings = Object.fromEntries(Object.entries(next).filter(([shape, id]) => SHAPES.includes(shape) && typeof id === "string"));
     for (const manager of managers) synchronize(manager);
+    api?.redraw?.();
   }
   const previews = new WeakMap();
   function preview(mesh, attributes) {

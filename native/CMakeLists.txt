@@ -34,7 +34,10 @@ endif()
 set_property(GLOBAL PROPERTY KRITA_IOS_STATIC_PLUGIN_TARGETS ${_selected_plugins})
 krita_ios_target_static_plugins(FeatherKritaEngine)
 set_property(GLOBAL PROPERTY KRITA_IOS_STATIC_PLUGIN_TARGETS ${_all_plugins})
+get_property(_all_resources GLOBAL PROPERTY KRITA_IOS_STATIC_RESOURCE_NAMES)
+set_property(GLOBAL PROPERTY KRITA_IOS_STATIC_RESOURCE_NAMES sql kxmlgui)
 krita_ios_target_static_resources(FeatherKritaEngine)
+set_property(GLOBAL PROPERTY KRITA_IOS_STATIC_RESOURCE_NAMES ${_all_resources})
 qt_add_resources(_resources
     "${CMAKE_SOURCE_DIR}/plugins/paintops/defaultpresets/defaultpresets.qrc"
     "${CMAKE_SOURCE_DIR}/krita/data/mime-database/mime-database.qrc")

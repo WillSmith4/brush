@@ -5,6 +5,7 @@
 #include <QBuffer>
 #include <QCryptographicHash>
 #include <QDir>
+#include <QDomDocument>
 #include <QFileInfo>
 #include <QImage>
 #include <QJsonArray>
@@ -34,6 +35,7 @@
 #include <KisResourceStorage.h>
 #include <KisResourceTypes.h>
 #include <kis_brush_registry.h>
+#include <kis_brush.h>
 #include <brushengine/kis_paint_information.h>
 #include <brushengine/kis_paintop_preset.h>
 #include <brushengine/kis_paintop_registry.h>
@@ -104,10 +106,27 @@ void appendPreset(QJsonArray &result, KoResourceSP resource, const QString &iden
     const QString engine = preset->paintOp().id();
     if (!KisPaintOpRegistry::instance()->contains(engine)) return;
     Q_UNUSED(identity);
-    const QByteArray identityBytes = preset->md5Sum() + engine.toUtf8() + preset->filename().toUtf8();
+    const QByteArray identityBytes = preset->md5Sum().toUtf8() + engine.toUtf8() + preset->filename().toUtf8();
     const QString id = QString::fromLatin1(QCryptographicHash::hash(identityBytes, QCryptographicHash::Sha256).toHex());
     presets[id] = preset;
     result.append(QJsonObject{{"id", id}, {"name", preset->name()}, {"engine", engine}});
+}
+
+void appendBrushTip(QJsonArray &result, KoResourceSP resource, const QString &identity) {
+    auto brush = resource.dynamicCast<KisBrush>();
+    if (!brush || !brush->valid()) return;
+    auto preset = KisPaintOpRegistry::instance()->defaultPreset(KoID("paintbrush"), KisGlobalResourcesInterface::instance());
+    if (!preset || !preset->settings()) return;
+    QDomDocument definition("Brush");
+    QDomElement element = definition.createElement("Brush");
+    definition.appendChild(element);
+    brush->toXML(definition, element);
+    preset->settings()->setProperty("brush_definition", definition.toString());
+    preset->settings()->setProperty("PressureSize", true);
+    preset->setName(brush->name());
+    preset->setFilename(brush->filename() + ".kpp");
+    preset->setValid(true);
+    appendPreset(result, preset, identity);
 }
 
 QJsonObject importPresets(const QJsonObject &request) {
@@ -115,20 +134,31 @@ QJsonObject importPresets(const QJsonObject &request) {
     require(!path.isEmpty() && QFileInfo(path).isFile(), "The selected file cannot be read.");
     QJsonArray result;
     KisResourceStorageSP storage(new KisResourceStorage(path));
-    if (storage->valid() && storage->type() == KisResourceStorage::StorageType::Bundle) {
+    if (storage->valid() && (storage->type() == KisResourceStorage::StorageType::Bundle ||
+        storage->type() == KisResourceStorage::StorageType::AdobeBrushLibrary)) {
         require(KisResourceLocator::instance()->addStorage(path, storage), "Krita could not register this resource bundle.");
         auto iterator = storage->resources(ResourceType::PaintOpPresets);
-        require(bool(iterator), "The bundle contains no brush preset collection.");
-        while (iterator->hasNext()) {
+        while (iterator && iterator->hasNext()) {
             iterator->next();
             appendPreset(result, iterator->resource(), path + ':' + iterator->url());
         }
+        if (result.isEmpty()) {
+            auto tips = storage->resources(ResourceType::Brushes);
+            while (tips && tips->hasNext()) {
+                tips->next();
+                appendBrushTip(result, tips->resource(), path + ':' + tips->url());
+            }
+        }
     } else {
-        auto resource = KisResourceLocator::instance()->importResourceFromFile(
-            ResourceType::PaintOpPresets, path, false);
-        appendPreset(result, resource, path);
+        auto *registry = KisResourceLoaderRegistry::instance();
+        const QString mime = KisMimeDatabase::mimeTypeForFile(path);
+        if (registry->loader(ResourceType::PaintOpPresets, mime)) {
+            appendPreset(result, KisResourceLocator::instance()->importResourceFromFile(ResourceType::PaintOpPresets, path, false), path);
+        } else if (registry->loader(ResourceType::Brushes, mime)) {
+            appendBrushTip(result, KisResourceLocator::instance()->importResourceFromFile(ResourceType::Brushes, path, false), path);
+        }
     }
-    require(!result.isEmpty(), "No usable brush presets were found. A brush tip or resource library alone is not a paint preset.");
+    require(!result.isEmpty(), "Krita found no supported brush presets or brush tips in this file.");
     return {{"presets", result}};
 }
 
@@ -169,11 +199,11 @@ QJsonObject render(const QJsonObject &request) {
     resources->setBGColorOverride(KoColor(Qt::white, space));
     resources->setOpacity(std::clamp(request["opacity"].toDouble(1.0), 0.0, 1.0));
     resources->setMirroring(false, false);
-    auto *strategy = new FreehandStrokeStrategy(resources, new KisFreehandStrokeInfo(),
-        kundo2_noi18n("Brush texture"), FreehandStrokeStrategy::None, request["seed"].toInt(1));
     QVector<KisPaintInformation> validatedPoints;
     validatedPoints.reserve(points.size());
     for (const auto &value : points) validatedPoints.append(point(value.toArray()));
+    auto *strategy = new FreehandStrokeStrategy(resources, new KisFreehandStrokeInfo(),
+        kundo2_noi18n("Brush texture"), FreehandStrokeStrategy::None, request["seed"].toInt(1));
     const KisStrokeId stroke = image->startStroke(strategy);
     auto previous = validatedPoints[0];
     if (validatedPoints.size() == 1) image->addJob(stroke, new FreehandStrokeStrategy::Data(0, previous));

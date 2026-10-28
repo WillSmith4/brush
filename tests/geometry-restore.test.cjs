@@ -19,6 +19,8 @@ function fixture() {
     constructor(){this.sceneGroup=new THREE.Group();this.curveIdToGeomInfo=new Map();}
     makeCurves(){} makeCurve(){} updateCurve(){} copyCurveGeom(){} removeCurve(){} removeCurves(){}
     clear(){this.curveIdToGeomInfo.clear();}
+    turnOnOff(on){this.geom.geometry.setDrawRange(0,on?60:0);}
+    timelapse(count){this.geom.geometry.setDrawRange(0,count);}
     getGeomFromInfo(){return this.geom;}
   }
   context.FeatherKrita.attach(Manager,{Geometry:THREE.BufferGeometry,Attribute:THREE.BufferAttribute,
@@ -65,4 +67,14 @@ test('restoring during native rendering cannot reapply a stale result',async()=>
   context.FeatherKrita.setBindings({RECT:'preset'});manager.makeCurves();
   context.FeatherKrita.setBindings({});
   await tick();await tick();assert.equal(manager.sceneGroup.children.length,1);
+});
+
+test('visibility changes and timelapse also constrain replacement geometry',async()=>{
+  const {context,manager}=fixture();
+  context.FeatherKrita.setBindings({RECT:'preset'});manager.makeCurves();
+  await tick();await tick();
+  const replacement=manager.sceneGroup.children[1];
+  manager.turnOnOff(false);assert.equal(replacement.geometry.drawRange.count,0);
+  manager.turnOnOff(true);assert.equal(replacement.geometry.drawRange.count,60);
+  manager.timelapse(24);assert.equal(replacement.geometry.drawRange.count,24);
 });
