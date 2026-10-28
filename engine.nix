@@ -25,6 +25,7 @@ in original.overrideAttrs (old: {
     cp feather-native/FeatherKritaEngine.dylib "$out/lib/"
     cp engine-build-plan.txt "$out/"
     cp ../krita/data/bundles/Krita_4_Default_Resources.bundle "$out/resources/bundles/"
+    cp -R ../krita/data/profiles "$out/resources/profiles"
     cp ../COPYING "$out/licenses/LibrePaint-COPYING"
     cp -R ../packaging/ios/notices "$out/licenses/notices"
     cp -R ../packaging/ios/manifests "$out/licenses/manifests"

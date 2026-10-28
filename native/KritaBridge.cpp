@@ -78,6 +78,7 @@ QJsonObject initialize(const QJsonObject &request) {
     QCoreApplication::setApplicationName("FeatherKrita");
     QCoreApplication::setOrganizationName("FeatherKrita");
     KoResourcePaths::s_overrideAppDataLocation = storageRoot;
+    KoResourcePaths::addAssetDir("icc_profiles", resources + "/profiles", true);
     auto *loaders = KisResourceLoaderRegistry::instance();
     KisPaintOpRegistry::registerResourceLoader(*loaders);
     KisBrushRegistry::registerResourceLoaders(*loaders);

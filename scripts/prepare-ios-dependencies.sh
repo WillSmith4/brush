@@ -34,7 +34,7 @@ PY
 cd upstream
 nix develop --print-build-logs --profile "$RUNNER_TEMP/brush-ios-profile" \
   .#librepaint-ios-incremental-env \
-  --command bash -c 'cmake --version; ninja --version; xcrun --sdk iphoneos clang++ --version' \
+  --command bash -c 'cmake --version; ninja --version; /usr/bin/xcrun --sdk iphoneos clang++ --version' \
   2>&1 | tee ../artifacts/dependencies.log
 printf '%s\n' "$revision" > ../artifacts/upstream-revision.txt
 nix-store --query --requisites "$RUNNER_TEMP/brush-ios-profile" > ../artifacts/dependency-paths.txt

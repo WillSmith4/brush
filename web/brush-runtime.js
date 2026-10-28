@@ -114,6 +114,9 @@
   function materialFor(original, texture) {
     const material = new api.ShaderMaterial();
     material.copy(original);
+    for (const flag of ["isCurveMaterial", "isCutoutMaterial", "isSelectionMaterial"]) {
+      if (flag in original) material[flag] = original[flag];
+    }
     const declaration = "varying vec2 fkTexCoord;\n";
     material.vertexShader = "attribute vec2 fkUV;\n" + declaration + original.vertexShader.replace(
       /void\s+main\s*\(\s*\)\s*\{/, "$&\n fkTexCoord = fkUV;");
