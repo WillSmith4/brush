@@ -6,3 +6,4 @@ result*
 *.ipa
 *.app/
 *.dylib
+node_modules/

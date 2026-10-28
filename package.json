@@ -1,0 +1,6 @@
+{
+  "name": "feather-krita-integration-contracts",
+  "private": true,
+  "scripts": {"test": "node --test tests/*.test.cjs"},
+  "devDependencies": {"three": "0.165.0"}
+}

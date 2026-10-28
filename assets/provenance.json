@@ -1,0 +1,6 @@
+{
+  "source": "https://github.com/HaidarPhantom/iOS-Mod-Menu-Template-for-Theos",
+  "commit": "4bac33d5fda8a7e6a5ff7a20bb99a2ac88a3ad39",
+  "file": "template/Tweak.xm",
+  "adopted": "Base64 PNG menuIcon and menuButton assets only; overlay implementation is separate."
+}

@@ -10,6 +10,11 @@ in original.overrideAttrs (old: {
     printf '\nadd_subdirectory(feather-native)\n' >> CMakeLists.txt
   '';
   buildTargets = [ "FeatherKritaEngine" ];
+  preBuild = ''
+    ninja -n FeatherKritaEngine > engine-build-plan.txt
+    printf 'Native engine build command count: '
+    wc -l < engine-build-plan.txt
+  '';
   doInstallCheck = false;
   preInstall = "";
   postInstall = "";
@@ -18,6 +23,7 @@ in original.overrideAttrs (old: {
   installPhase = ''
     mkdir -p "$out/lib" "$out/resources/bundles" "$out/licenses"
     cp feather-native/FeatherKritaEngine.dylib "$out/lib/"
+    cp engine-build-plan.txt "$out/"
     cp ../krita/data/bundles/Krita_4_Default_Resources.bundle "$out/resources/bundles/"
     cp ../COPYING "$out/licenses/LibrePaint-COPYING"
     cp -R ../packaging/ios/notices "$out/licenses/notices"
