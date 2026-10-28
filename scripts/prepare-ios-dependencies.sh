@@ -12,7 +12,8 @@ test "$(git -C upstream rev-parse HEAD)" = "$revision"
 test "$(uname -m)" = arm64
 xcodebuild -version | tee artifacts/xcode.txt
 xcrun --sdk iphoneos --show-sdk-version | tee artifacts/sdk.txt
-test "$(xcodebuild -version | head -1)" = 'Xcode 26.6'
+xcode_description="$(xcodebuild -version)"
+test "${xcode_description%%$'\n'*}" = 'Xcode 26.6'
 test "$(xcrun --sdk iphoneos --show-sdk-version)" = '26.5'
 
 # Evaluate one source-independent profile for the entire dependency build.
