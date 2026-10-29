@@ -8,6 +8,7 @@
 #include <QDomDocument>
 #include <QFileInfo>
 #include <QImage>
+#include <QImageReader>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -41,6 +42,8 @@
 #include <brushengine/kis_paintop_preset.h>
 #include <brushengine/kis_paintop_registry.h>
 #include <brushengine/kis_paintop_settings.h>
+#include <brushengine/KisOptimizedBrushOutline.h>
+#include <kis_paint_device.h>
 #include <kis_group_layer.h>
 #include <kis_image.h>
 #include <kis_paint_layer.h>
@@ -177,12 +180,44 @@ KisPaintInformation point(const QJsonArray &v) {
     return p;
 }
 
+QJsonObject presetInfo(const QJsonObject &request) {
+    const QString id = request["preset"].toString();
+    require(presets.contains(id), "The selected brush preset is no longer loaded.");
+    auto preset = presets[id]->clone().dynamicCast<KisPaintOpPreset>();
+    preset->settings()->setPaintOpSize(128.0);
+    KisPaintOpSettings::OutlineMode mode;
+    mode.isVisible = true;
+    mode.forceFullSize = true;
+    const auto outline = preset->settings()->brushOutline(point(QJsonArray{0, 0, 1}), mode, 1.0);
+    const QRectF bounds = outline.boundingRect();
+    QJsonArray polygons;
+    for (const auto &polygon : outline) {
+        QJsonArray vertices;
+        for (const auto &p : polygon) vertices.append(QJsonArray{p.x() / 128.0, p.y() / 128.0});
+        polygons.append(vertices);
+    }
+    const QString engine = preset->paintOp().id();
+    return {{"engine", engine}, {"outline", polygons},
+        {"extent", std::max({1.0, std::abs(bounds.left()) / 64.0,
+            std::abs(bounds.right()) / 64.0, std::abs(bounds.top()) / 64.0,
+            std::abs(bounds.bottom()) / 64.0})},
+        {"samplesBackdrop", engine == "colorsmudge" || engine == "filter"}};
+}
+
+QString encodePng(const QImage &image) {
+    QByteArray png;
+    QBuffer buffer(&png);
+    buffer.open(QIODevice::WriteOnly);
+    require(image.save(&buffer, "PNG"), "Cannot encode the native brush output.");
+    return QString::fromLatin1(png.toBase64());
+}
+
 QJsonObject render(const QJsonObject &request) {
     const QString id = request["preset"].toString();
     require(presets.contains(id), "The selected brush preset is no longer loaded.");
     const int width = request["width"].toInt(), height = request["height"].toInt();
     const QJsonArray points = request["points"].toArray(), color = request["color"].toArray();
-    require(width > 0 && width <= 4096 && height > 0 && height <= 1024 &&
+    require(width > 0 && width <= 4096 && height > 0 && height <= 4096 &&
         qint64(width) * height <= 2097152, "The requested stroke texture is too large.");
     require(!points.isEmpty() && points.size() <= 10000 && color.size() >= 3, "Invalid stroke input.");
     const double size = request["size"].toDouble();
@@ -195,7 +230,24 @@ QJsonObject render(const QJsonObject &request) {
     image->setWorkingThreadsLimit(1);
     KisPaintLayerSP layer = new KisPaintLayer(image, "Brush", OPACITY_OPAQUE_U8);
     image->addNode(layer, image->rootLayer());
+    // Smudge reads the actual visible host artwork, including native Feather
+    // strokes. Seed the working layer itself, so both smudge overlay modes work.
+    QImage backdrop;
+    if (request.contains("backdrop")) {
+        const QString encoded = request["backdrop"].toString();
+        require(encoded.size() <= 16777216, "The brush backdrop is too large.");
+        QByteArray bytes = QByteArray::fromBase64(encoded.toLatin1());
+        QBuffer source(&bytes); source.open(QIODevice::ReadOnly);
+        QImageReader reader(&source, "PNG");
+        require(reader.size() == QSize(width, height), "The brush backdrop dimensions do not match.");
+        backdrop = reader.read().convertToFormat(QImage::Format_ARGB32);
+        require(!backdrop.isNull(), "Cannot decode the brush backdrop.");
+        layer->paintDevice()->convertFromQImage(backdrop, nullptr);
+    }
     image->initialRefreshGraph(); image->waitForDone();
+    // Compare in the engine's actual color space, after import/rounding, so
+    // unrelated pixels never become part of the returned paint surface.
+    if (!backdrop.isNull()) backdrop = layer->paintDevice()->convertToQImage(nullptr, 0, 0, width, height).convertToFormat(QImage::Format_ARGB32);
     KisResourcesSnapshotSP resources = new KisResourcesSnapshot(image, layer);
     resources->setBrush(preset);
     const QColor foreground(std::clamp(color[0].toInt(), 0, 255), std::clamp(color[1].toInt(), 0, 255), std::clamp(color[2].toInt(), 0, 255));
@@ -218,10 +270,21 @@ QJsonObject render(const QJsonObject &request) {
     }
     image->addJob(stroke, new KisAsynchronousStrokeUpdateHelper::UpdateData(true));
     image->endStroke(stroke); image->waitForDone();
-    const QImage output = layer->paintDevice()->convertToQImage(nullptr, 0, 0, width, height);
-    QByteArray png; QBuffer buffer(&png); buffer.open(QIODevice::WriteOnly);
-    require(output.save(&buffer, "PNG"), "Cannot encode the native brush output.");
-    return {{"width", width}, {"height", height}, {"png", QString::fromLatin1(png.toBase64())}};
+    QImage output = layer->paintDevice()->convertToQImage(nullptr, 0, 0, width, height).convertToFormat(QImage::Format_ARGB32);
+    QImage coverage(width, height, QImage::Format_ARGB32);
+    coverage.fill(Qt::transparent);
+    for (int y = 0; y < height; ++y) {
+        auto *row = reinterpret_cast<QRgb *>(output.scanLine(y));
+        auto *mask = reinterpret_cast<QRgb *>(coverage.scanLine(y));
+        const auto *before = backdrop.isNull() ? nullptr : reinterpret_cast<const QRgb *>(backdrop.constScanLine(y));
+        for (int x = 0; x < width; ++x) {
+            const bool changed = before ? row[x] != before[x] && (qAlpha(row[x]) || qAlpha(before[x])) : qAlpha(row[x]) != 0;
+            if (changed) mask[x] = qRgba(255, 255, 255, 255);
+            else row[x] = 0;
+        }
+    }
+    return {{"width", width}, {"height", height}, {"png", encodePng(output)},
+        {"coverage", encodePng(coverage)}, {"composited", !backdrop.isNull()}};
 }
 }
 
@@ -238,6 +301,7 @@ extern "C" char *FKRequest(const char *json) {
         else {
             require(initialized && QThread::currentThread() == application->thread(), "The brush runtime is not ready on this thread.");
             if (command == "import") response = importPresets(request);
+            else if (command == "presetInfo") response = presetInfo(request);
             else if (command == "render") response = render(request);
             else throw std::runtime_error("Unknown brush command.");
         }
