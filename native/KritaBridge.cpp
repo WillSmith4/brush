@@ -15,6 +15,8 @@
 #include <QMap>
 #include <QThread>
 #include <QPluginLoader>
+#include <dispatch/dispatch.h>
+#include <memory>
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -212,7 +214,30 @@ QString encodePng(const QImage &image) {
     return QString::fromLatin1(png.toBase64());
 }
 
-QJsonObject render(const QJsonObject &request) {
+struct RenderJob {
+    KisImageSP image;
+    KisPaintLayerSP layer;
+    QImage backdrop;
+    int width = 0, height = 0;
+};
+
+void matchCursorSize(KisPaintOpPresetSP preset, double size) {
+    // The cursor deliberately ignores the preset's static Size sensor value.
+    // Normalize that value at full pressure; retain pressure dynamics around it.
+    preset->settings()->setPaintOpSize(128.0);
+    KisPaintOpSettings::OutlineMode mode;
+    mode.isVisible = true; mode.forceFullSize = true;
+    const auto info = point(QJsonArray{0, 0, 1});
+    const QRectF full = preset->settings()->brushOutline(info, mode, 1.0).boundingRect();
+    mode.forceFullSize = false;
+    const QRectF actual = preset->settings()->brushOutline(info, mode, 1.0).boundingRect();
+    const double expected = std::max(full.width(), full.height());
+    const double measured = std::max(actual.width(), actual.height());
+    const double correction = measured > 0.01 && expected > 0.01 ? std::clamp(expected / measured, 0.05, 20.0) : 1.0;
+    preset->settings()->setPaintOpSize(size * correction);
+}
+
+std::unique_ptr<RenderJob> prepareRender(const QJsonObject &request) {
     const QString id = request["preset"].toString();
     require(presets.contains(id), "The selected brush preset is no longer loaded.");
     const int width = request["width"].toInt(), height = request["height"].toInt();
@@ -224,7 +249,7 @@ QJsonObject render(const QJsonObject &request) {
     require(std::isfinite(size) && size > 0 && size <= 2048, "Invalid brush size.");
     auto preset = presets[id]->clone().dynamicCast<KisPaintOpPreset>();
     require(bool(preset), "Cannot clone the selected brush preset.");
-    preset->settings()->setPaintOpSize(size);
+    matchCursorSize(preset, size);
     const auto *space = KoColorSpaceRegistry::instance()->rgb8();
     KisImageSP image = new KisImage(new KisDumbUndoStore(), width, height, space, "Stroke texture");
     image->setWorkingThreadsLimit(1);
@@ -244,7 +269,7 @@ QJsonObject render(const QJsonObject &request) {
         require(!backdrop.isNull(), "Cannot decode the brush backdrop.");
         layer->paintDevice()->convertFromQImage(backdrop, nullptr);
     }
-    image->initialRefreshGraph(); image->waitForDone();
+    image->initialRefreshGraph();
     // Compare in the engine's actual color space, after import/rounding, so
     // unrelated pixels never become part of the returned paint surface.
     if (!backdrop.isNull()) backdrop = layer->paintDevice()->convertToQImage(nullptr, 0, 0, width, height).convertToFormat(QImage::Format_ARGB32);
@@ -269,7 +294,18 @@ QJsonObject render(const QJsonObject &request) {
         previous = next;
     }
     image->addJob(stroke, new KisAsynchronousStrokeUpdateHelper::UpdateData(true));
-    image->endStroke(stroke); image->waitForDone();
+    image->endStroke(stroke);
+    auto job = std::make_unique<RenderJob>();
+    job->image = image; job->layer = layer; job->backdrop = backdrop;
+    job->width = width; job->height = height;
+    return job;
+}
+
+QJsonObject finishRender(RenderJob &job) {
+    const int width = job.width, height = job.height;
+    const auto &layer = job.layer;
+    const QImage &backdrop = job.backdrop;
+    job.image->waitForDone();
     QImage output = layer->paintDevice()->convertToQImage(nullptr, 0, 0, width, height).convertToFormat(QImage::Format_ARGB32);
     QImage coverage(width, height, QImage::Format_ARGB32);
     coverage.fill(Qt::transparent);
@@ -302,7 +338,7 @@ extern "C" char *FKRequest(const char *json) {
             require(initialized && QThread::currentThread() == application->thread(), "The brush runtime is not ready on this thread.");
             if (command == "import") response = importPresets(request);
             else if (command == "presetInfo") response = presetInfo(request);
-            else if (command == "render") response = render(request);
+            else if (command == "render") { auto job = prepareRender(request); response = finishRender(*job); }
             else throw std::runtime_error("Unknown brush command.");
         }
         response["ok"] = true;
@@ -317,3 +353,44 @@ extern "C" char *FKRequest(const char *json) {
     return result;
 }
 extern "C" void FKFreeResponse(char *response) { std::free(response); }
+
+// Prepare resource snapshots on Qt's owner thread. Painting already uses Krita's
+// scheduler; wait for it and encode PNGs off the UI thread. Destruct the image
+// and deliver the result back on its owner thread, exactly once.
+extern "C" void FKRenderAsync(const char *json, FKRenderCompletion completion, void *context) {
+    struct Pending {
+        std::unique_ptr<RenderJob> job;
+        FKRenderCompletion completion;
+        void *context;
+        QByteArray bytes;
+    };
+    if (!completion) return;
+    try {
+        require(initialized && QThread::currentThread() == application->thread(), "The brush runtime is not ready on this thread.");
+        require(json, "Missing request.");
+        QJsonParseError error;
+        const auto document = QJsonDocument::fromJson(QByteArray(json), &error);
+        require(error.error == QJsonParseError::NoError && document.isObject(), "Malformed brush request.");
+        auto pending = std::make_unique<Pending>();
+        pending->job = prepareRender(document.object());
+        pending->completion = completion; pending->context = context;
+        dispatch_async_f(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), pending.release(), [](void *raw) {
+            auto *pending = static_cast<Pending *>(raw);
+            QJsonObject response;
+            try { response = finishRender(*pending->job); response["ok"] = true; }
+            catch (const std::exception &e) { response = {{"ok", false}, {"error", QString::fromUtf8(e.what())}}; }
+            catch (...) { response = {{"ok", false}, {"error", "The native brush renderer failed."}}; }
+            pending->bytes = QJsonDocument(response).toJson(QJsonDocument::Compact);
+            dispatch_async_f(dispatch_get_main_queue(), pending, [](void *raw) {
+                std::unique_ptr<Pending> pending(static_cast<Pending *>(raw));
+                pending->job.reset();
+                pending->completion(pending->bytes.constData(), pending->context);
+            });
+        });
+    } catch (const std::exception &e) {
+        const QByteArray bytes = QJsonDocument(QJsonObject{{"ok", false}, {"error", QString::fromUtf8(e.what())}}).toJson(QJsonDocument::Compact);
+        completion(bytes.constData(), context);
+    } catch (...) {
+        completion("{\"ok\":false,\"error\":\"Cannot prepare the native brush render.\"}", context);
+    }
+}

@@ -7,6 +7,7 @@ nix build --impure --print-build-logs --out-link build/engine \
 mkdir -p artifacts
 cp build/engine/lib/FeatherKritaEngine.dylib artifacts/
 xcrun --sdk iphoneos nm -gU artifacts/FeatherKritaEngine.dylib > artifacts/engine-exports.txt
+grep -q ' _FKRenderAsync$' artifacts/engine-exports.txt
 grep -q ' _FKRequest$' artifacts/engine-exports.txt
 grep -q ' _FKFreeResponse$' artifacts/engine-exports.txt
 xcrun --sdk iphoneos vtool -show-build artifacts/FeatherKritaEngine.dylib > artifacts/engine-platform.txt
