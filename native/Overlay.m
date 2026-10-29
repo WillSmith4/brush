@@ -233,7 +233,7 @@ static NSDictionary *FKCall(NSDictionary *request) {
 }
 - (void)restore {
     [self.bindings removeObjectForKey:self.shape]; [self publishBindings];
-    self.statusLabel.text = @"Original Feather brush restored.";
+    self.statusLabel.text = @"Original brush restored for new strokes. Existing artwork is kept.";
 }
 - (void)userContentController:(WKUserContentController *)controller didReceiveScriptMessage:(WKScriptMessage *)message replyHandler:(void (^)(id, NSString *))reply {
     NSURL *url = message.frameInfo.request.URL;
@@ -263,9 +263,29 @@ static NSDictionary *FKCall(NSDictionary *request) {
     } else if ([command isEqualToString:@"error"]) {
         if ([body[@"message"] isKindOfClass:NSString.class]) self.statusLabel.text = body[@"message"];
         reply(@{@"ok": @YES}, nil);
-    } else if ([command isEqualToString:@"render"] && self.engineReady) {
+    } else if ([command isEqualToString:@"loadStroke"] || [command isEqualToString:@"saveStroke"]) {
+        NSString *identifier = body[@"id"];
+        NSCharacterSet *allowed = [NSCharacterSet characterSetWithCharactersInString:@"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" ];
+        if (![identifier isKindOfClass:NSString.class] || !identifier.length || identifier.length > 128 || [identifier rangeOfCharacterFromSet:allowed.invertedSet].location != NSNotFound) { reply(nil, @"Invalid stroke identifier."); return; }
+        NSString *folder = [FKDirectory() stringByAppendingPathComponent:@"Strokes-v2"];
+        NSString *path = [folder stringByAppendingPathComponent:[identifier stringByAppendingString:@".json"]];
+        if ([command isEqualToString:@"loadStroke"]) {
+            NSData *data = [NSData dataWithContentsOfFile:path];
+            id record = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+            reply(@{@"ok": @YES, @"record": record ?: NSNull.null}, nil);
+        } else {
+            NSDictionary *record = body[@"record"];
+            if (![record isKindOfClass:NSDictionary.class]) { reply(nil, @"Invalid stroke record."); return; }
+            NSError *error = nil;
+            NSData *data = [NSJSONSerialization dataWithJSONObject:record options:0 error:&error];
+            if (!data || data.length > 33554432) { reply(nil, @"Stroke data is invalid or too large."); return; }
+            if (![NSFileManager.defaultManager createDirectoryAtPath:folder withIntermediateDirectories:YES attributes:nil error:&error] || ![data writeToFile:path options:NSDataWritingAtomic error:&error]) { reply(nil, error.localizedDescription ?: @"Cannot save this stroke."); return; }
+            reply(@{@"ok": @YES}, nil);
+        }
+    } else if ([command isEqualToString:@"render"] || [command isEqualToString:@"presetInfo"]) {
         NSString *preset = body[@"preset"];
-        if (![self.bindings.allValues containsObject:preset]) { reply(nil, @"Brush binding is no longer active."); return; }
+        // A finished stroke retains its preset after Restore and after restart.
+        if (![self initializeEngine] || !self.presets[preset]) { reply(nil, @"The saved brush resource is unavailable."); return; }
         NSDictionary *response = FKCall(body);
         reply(response, nil);
     } else reply(nil, @"The brush engine is not ready.");
