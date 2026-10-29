@@ -19,6 +19,17 @@ Krita surfaces. Native Krita operates on that substrate. Only changed pixels for
 the new surface; sampled depth keeps paint on the visible substrate. This is
 painting on the visible projected surface, not volumetric mixing of hidden faces.
 
+Capture temporarily aligns Feather's explicit fragment-depth uniforms with the
+sampling camera and restores them afterward. Disconnected substrate depths do
+not form bridging triangles. Older v2 paint keeps its saved raster but ignores
+the mixed-camera depth map when rebuilding its surface; its saved data is kept.
+
+Apple Pencil Hover uses the native preset's cursor outline at the selected brush
+size and surface orientation. It does not create strokes or sample the canvas.
+Switching presets updates the outline, Pencil-down hides it, and Restore returns
+to the host preview. The existing host hover capability and cursor preference
+still control when the preview appears.
+
 The native engine is built from LibrePaint revision
 `e9946cce637d66003ca1b22dd9141db78f177cef`, with its Krita paint operators,
 resource loaders, color management, and stroke scheduler. The build uses Xcode

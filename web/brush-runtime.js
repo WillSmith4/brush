@@ -7,6 +7,7 @@
   const managers = new Set(), states = new WeakMap(), latestAttributes = new WeakMap();
   const artworks = new Map(), metadata = new Map(), assets = new Map(), previews = new WeakMap();
   const restoringSurfaces = new Set();
+  const hoverStates=new Map();
   let renderTail = Promise.resolve(), textureBytes = 0;
   const MAX_TEXTURE_BYTES = 64 * 1024 * 1024;
   const post = body => root.webkit.messageHandlers.FeatherKrita.postMessage(body);
@@ -165,6 +166,7 @@
     if(!api.renderer || !api.scene || !api.camera)throw new Error("Scene sampling is unavailable for this blending brush.");
     const renderer=api.renderer(),scene=api.scene(),camera=api.camera().clone();
     const vec=a=>new api.Vector3(...a),distance=Math.max(frame.size*8,1),near=0.001,far=distance*2;
+    camera.matrixAutoUpdate=true;camera.matrixWorldAutoUpdate=true;
     camera.position.copy(vec(add(frame.origin,mul(frame.normal,distance))));
     camera.up.copy(vec(frame.v));camera.lookAt(vec(frame.origin));
     camera.near=near;camera.far=far;camera.isPerspectiveCamera=false;camera.isOrthographicCamera=true;
@@ -178,10 +180,25 @@
     const oldTarget=renderer.getRenderTarget(),scissorTest=renderer.getScissorTest();
     const color=renderer.getClearColor(new api.Color()).clone(),alpha=renderer.getClearAlpha();
     const shadow=renderer.shadowMap.autoUpdate,background=scene.background,fog=scene.fog;
-    const hidden=[];
+    const hidden=[],captureUniforms=new Map();
     // Only artwork and lights participate. No cursor, grid, ground, or live preview.
     const art=api.artGroup();
-    scene.traverse(object=>{if(!object.isMesh&&!object.isLine&&!object.isPoints&&!object.isSprite)return;let inArt=false;for(let p=object;p;p=p.parent)if(p===art){inArt=true;break;}if(!inArt&&object.visible){hidden.push(object);object.visible=false;}});
+    scene.traverse(object=>{
+      if(!object.isMesh&&!object.isLine&&!object.isPoints&&!object.isSprite)return;
+      let inArt=false;for(let p=object;p;p=p.parent)if(p===art){inArt=true;break;}
+      if(!inArt&&object.visible){hidden.push(object);object.visible=false;}
+      // Feather writes gl_FragDepth using its near/far uniforms. They must
+      // describe this capture camera, otherwise native and Feather meshes use
+      // incompatible depth values in the same texture (and reconstruct spikes).
+      for(const material of Array.isArray(object.material)?object.material:[object.material]){
+        if(!material?.fragmentShader?.includes("gl_FragDepth"))continue;
+        for(const [name,value] of [["near",near],["far",far]]){
+          const uniform=material.uniforms?.[name];if(!uniform)continue;
+          if(!captureUniforms.has(uniform))captureUniforms.set(uniform,uniform.value);
+          uniform.value=value;
+        }
+      }
+    });
     try{
       renderer.shadowMap.autoUpdate=false;scene.background=null;scene.fog=null;
       renderer.setRenderTarget(target);renderer.setViewport(0,0,frame.width,frame.height);renderer.setScissorTest(false);
@@ -209,7 +226,10 @@
       const depthMaterial=new api.ShaderMaterial({depthTest:false,depthWrite:false,uniforms:{depthMap:{value:target.depthTexture},size:{value:[frame.width,frame.height]}},
         vertexShader:"void main(){gl_Position=vec4(position,1.0);}",
         fragmentShader:"uniform sampler2D depthMap;uniform vec2 size;void main(){float z=texture2D(depthMap,gl_FragCoord.xy/size).r;if(z>=0.999999){gl_FragColor=vec4(0.0);return;}float v=floor(z*16777215.0+0.5);gl_FragColor=vec4(floor(v/65536.0),mod(floor(v/256.0),256.0),mod(v,256.0),255.0)/255.0;}"});
-      const depthScene=new api.Scene();depthScene.add(new api.Mesh(depthGeometry,depthMaterial));
+      const depthScene=new api.Scene(),depthMesh=new api.Mesh(depthGeometry,depthMaterial);
+      // Clip-space fullscreen geometry must not be culled against a distant
+      // world-space brush position.
+      depthMesh.frustumCulled=false;depthScene.add(depthMesh);
       let depth;
       try{
         renderer.setRenderTarget(depthTarget);renderer.clear();renderer.render(depthScene,camera);
@@ -219,6 +239,7 @@
       }finally{depthTarget.dispose();depthGeometry.dispose();depthMaterial.dispose();}
       return {png,depth,near,far,distance};
     }finally{
+      for(const [uniform,value] of captureUniforms)uniform.value=value;
       hidden.forEach(o=>o.visible=true);scene.background=background;scene.fog=fog;renderer.shadowMap.autoUpdate=shadow;
       renderer.setRenderTarget(oldTarget);renderer.setViewport(viewport.x,viewport.y,viewport.z,viewport.w);
       renderer.setScissor(scissor.x,scissor.y,scissor.z,scissor.w);renderer.setScissorTest(scissorTest);renderer.setClearColor(color,alpha);target.dispose();
@@ -239,7 +260,7 @@
         // for saved paint to return before sampling another brush's substrate.
         await Promise.resolve();await Promise.all([...restoringSurfaces]);
         if(!active())return null;
-        const captured=snapshot(request.frame);request.body.backdrop=captured.png;record.surface={depth:captured.depth,near:captured.near,far:captured.far,distance:captured.distance};
+        const captured=snapshot(request.frame);request.body.backdrop=captured.png;record.surface={encoding:"linear-camera-v3",depth:captured.depth,near:captured.near,far:captured.far,distance:captured.distance};
       }
       const result=await checked(request.body);
       if(!active())return null;
@@ -263,7 +284,13 @@
       const canvas=document.createElement("canvas");canvas.width=result.width;canvas.height=result.height;
       const ctx=canvas.getContext("2d");ctx.drawImage(maskImage,0,0);
       entry.rectangles=coverageRectangles(ctx.getImageData(0,0,result.width,result.height).data,result.width,result.height);
-      if(record.surface){const depth=new Image();depth.src="data:image/png;base64,"+record.surface.depth;await depth.decode();ctx.clearRect(0,0,canvas.width,canvas.height);ctx.drawImage(depth,0,0);entry.depth=ctx.getImageData(0,0,result.width,result.height).data;}
+      // V2 persisted depth with mixed, unrecoverable camera ranges. Preserve
+      // its painted pixels but rebuild those surfaces on their original path.
+      if(record.surface?.encoding==="linear-camera-v3"){
+        const depth=new Image();depth.src="data:image/png;base64,"+record.surface.depth;await depth.decode();
+        if(depth.width!==result.width||depth.height!==result.height)throw new Error("Invalid saved brush depth dimensions.");
+        ctx.clearRect(0,0,canvas.width,canvas.height);ctx.drawImage(depth,0,0);entry.depth=ctx.getImageData(0,0,result.width,result.height).data;
+      }
       for(const [key,picture] of [["texture",image],["mask",maskImage]]){
         const texture=new api.Texture(picture);texture.needsUpdate=true;texture.generateMipmaps=false;texture.minFilter=api.LinearFilter;texture.magFilter=api.LinearFilter;entry[key]=texture;
       }
@@ -317,6 +344,17 @@
     const defines=JSON.stringify(original.defines);
     if(defines!==material.userData.fkDefines){material.defines={...original.defines};material.userData.fkDefines=defines;material.needsUpdate=true;}
   }
+  function surfaceHeight(frame,surface,depth,x,y,baseHeight) {
+    if(surface?.encoding!=="linear-camera-v3" || !depth)return null;
+    if(![surface.near,surface.far,surface.distance,frame.size,baseHeight].every(Number.isFinite)||surface.far<=surface.near)return null;
+    const px=clamp(Math.floor(x),0,frame.width-1),py=clamp(Math.floor(y),0,frame.height-1),at=(py*frame.width+px)*4;
+    if(depth[at+3]!==255)return null;
+    const z=(depth[at]*65536+depth[at+1]*256+depth[at+2])/16777215;
+    const height=surface.distance-(surface.near+z*(surface.far-surface.near));
+    // Ignore unrelated surfaces beyond the local brush footprint, and invalid
+    // far-plane pixels. Never let an outlier pull a vertex across the scene.
+    return Number.isFinite(height)&&z<0.999999&&Math.abs(height-baseHeight)<=frame.size*2?height:null;
+  }
   function surfaceGeometry(source,info,record,entry,attributes) {
     const {frame}=record,rectangles=[];
     const tile=entry.depth?8:32;
@@ -326,12 +364,12 @@
     for(const {r:[x0,y0,x1,y1]} of rectangles)for(const [x,y] of [[x0,y0],[x1,y0],[x1,y1],[x0,y1]]){
       const vertex={x,y,...mapPixel(frame,x,y,attributes,prepared)};
       if(entry.depth){
-        const px=clamp(Math.floor(x),0,frame.width-1),py=clamp(Math.floor(y),0,frame.height-1),at=(py*frame.width+px)*4;
-        if(entry.depth[at+3]){
-          const z=(entry.depth[at]*65536+entry.depth[at+1]*256+entry.depth[at+2])/16777215;
-          const height=record.surface.distance-(record.surface.near+z*(record.surface.far-record.surface.near));
-          const original=mapPixel(frame,x,y,record.attributes).position,baseHeight=dot(sub(original,frame.origin),frame.normal);
-          vertex.position=add(vertex.position,mul(vertex.normal,height-baseHeight));
+        const original=mapPixel(frame,x,y,record.attributes).position,baseHeight=dot(sub(original,frame.origin),frame.normal);
+        const height=surfaceHeight(frame,record.surface,entry.depth,x,y,baseHeight);
+        vertex.sampledHeight=height;
+        if(height!==null){
+          const projected=add(frame.origin,add(mul(frame.u,frame.minX+x/frame.scale),add(mul(frame.v,frame.maxY-y/frame.scale),mul(frame.normal,height))));
+          vertex.position=add(vertex.position,sub(projected,original));
         }
       }
       vertices.push(vertex);
@@ -353,9 +391,20 @@
     }
     const uv=new Float32Array(vertices.length*2);vertices.forEach((p,i)=>{uv[i*2]=p.x/frame.width;uv[i*2+1]=1-p.y/frame.height;});
     geometry.setAttribute("fkUV",new api.Attribute(uv,2));
-    const indices=new Uint32Array(rectangles.length*6);
-    rectangles.forEach((_,i)=>indices.set([i*4,i*4+2,i*4+1,i*4,i*4+3,i*4+2],i*6));
-    geometry.setIndex(new api.Attribute(indices,1));geometry.computeBoundingSphere();return geometry;
+    const indices=[];
+    rectangles.forEach((_,i)=>{
+      for(const triangle of [[i*4,i*4+2,i*4+1],[i*4,i*4+3,i*4+2]]){
+        // Do not bridge a silhouette or two disconnected substrate layers.
+        // Such edges are the other source of long, needle-like triangles.
+        if(entry.depth){
+          const values=triangle.map(k=>vertices[k].sampledHeight),valid=values.filter(v=>v!==null);
+          if(valid.length&&valid.length!==3)continue;
+          if(valid.length){const tolerance=Math.max(frame.size*.1,Math.SQRT2*tile/frame.scale*3);if(Math.max(...valid)-Math.min(...valid)>tolerance)continue;}
+        }
+        indices.push(...triangle);
+      }
+    });
+    geometry.setIndex(new api.Attribute(new Uint32Array(indices),1));geometry.computeBoundingSphere();return geometry;
   }
   function replaceCurve(manager,state,id,info,record,entry,attributes) {
     const geom=manager.getGeomFromInfo(info);if(!geom?.geometry?.index)return;
@@ -421,7 +470,74 @@
     const ready=()=>post({command:"ready"}).catch(fail);
     if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",()=>setTimeout(ready,250),{once:true});else setTimeout(ready,250);
   }
-  function setBindings(next){bindings=Object.fromEntries(Object.entries(next).filter(([shape,id])=>SHAPES.includes(shape)&&typeof id==="string"));}
+  function setBindings(next){
+    bindings=Object.fromEntries(Object.entries(next).filter(([shape,id])=>SHAPES.includes(shape)&&typeof id==="string"));
+    for(const [mesh,state] of hoverStates)hover(mesh,state.attributes,state.distance);
+  }
+  function hoverPositions(polygons,size,u=[1,0,0],v=[0,0,-1]){
+    const positions=[];
+    for(const polygon of polygons || []){
+      if(!Array.isArray(polygon)||polygon.length<2)continue;
+      if(polygon.some(p=>!Array.isArray(p)||p.length<2||!Number.isFinite(p[0])||!Number.isFinite(p[1])))throw new Error("Invalid native brush outline.");
+      for(let i=0;i<polygon.length;i++){
+        const p=polygon[i],q=polygon[(i+1)%polygon.length];if(p[0]===q[0]&&p[1]===q[1])continue;
+        for(const a of [p,q])positions.push(...add(mul(u,a[0]*size),mul(v,-a[1]*size)));
+      }
+    }
+    if(positions.length>600000)throw new Error("The brush outline is too complex.");
+    return new Float32Array(positions);
+  }
+  function releaseHover(state){
+    state.generation++;
+    if(state.mask){state.mask.array.fill(0);state.mask.needsUpdate=true;state.mask=null;}
+    if(state.line){state.line.removeFromParent();state.line.geometry.dispose();state.line.material.dispose();state.line=null;}
+    state.preset=null;state.outline=null;
+  }
+  function updateHover(mesh,state){
+    if(!state.line)return;
+    mesh.updateWorldMatrix(true,false);
+    const origin=mesh.getWorldPosition(new api.Vector3());
+    const n=new api.Vector3(0,1,0).transformDirection(mesh.matrixWorld).toArray();
+    const right=cameraRight(),u=unit(sub(right,mul(n,dot(right,n))),unit(cross([0,0,1],n),[1,0,0])),v=unit(cross(n,u));
+    const local=a=>mesh.worldToLocal(new api.Vector3(...a).add(origin)).toArray();
+    const size=Number(state.attributes.size)>0?Number(state.attributes.size):api.fallbackSize;
+    const positions=hoverPositions(state.outline,size,local(u),local(v));
+    const attribute=state.line.geometry.attributes.position;
+    if(attribute&&attribute.array.length===positions.length){attribute.array.set(positions);attribute.needsUpdate=true;}
+    else state.line.geometry.setAttribute("position",new api.Attribute(positions,3));
+    state.line.geometry.computeBoundingSphere();
+    const color=state.attributes.color || [0,0,0];
+    state.line.material.uniforms.fkHoverColor.value=color.slice(0,3).map(c=>c/255);
+    state.line.material.uniforms.fkHoverOpacity.value=clamp(1-Number(state.distance||0),0,1);
+    state.line.visible=true;
+    if(!state.mask)state.mask=maskSource(mesh.geometry,mesh.material);
+    state.mask.array.fill(1);state.mask.needsUpdate=true;
+  }
+  function hover(mesh,attributes,distance=0){
+    if(!attached||!mesh?.parent)return;
+    let state=hoverStates.get(mesh);
+    if(!state){state={generation:0,line:null,mask:null,preset:null};hoverStates.set(mesh,state);
+      state.removed=()=>{releaseHover(state);hoverStates.delete(mesh);mesh.removeEventListener("removed",state.removed);};
+      mesh.addEventListener("removed",state.removed);}
+    state.attributes=attributes;state.distance=distance;
+    const preset=bindings[attributes.shape];
+    if(!preset){releaseHover(state);api.redraw?.();return;}
+    if(state.preset===preset){updateHover(mesh,state);return;}
+    releaseHover(state);state.preset=preset;const generation=state.generation;
+    presetInfo(preset).then(meta=>{
+      if(state.generation!==generation||bindings[state.attributes.shape]!==preset||!mesh.parent)return;
+      const outline=meta.outline || [];
+      if(!hoverPositions(outline,1).length)throw new Error("This native brush returned no cursor outline.");
+      const geometry=new api.Geometry();
+      const material=new api.ShaderMaterial({glslVersion:"300 es",depthTest:false,depthWrite:false,transparent:true,
+        uniforms:{fkHoverColor:{value:[0,0,0]},fkHoverOpacity:{value:1}},
+        vertexShader:"void main(){gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0);}",
+        fragmentShader:"uniform vec3 fkHoverColor;uniform float fkHoverOpacity;layout(location=0)out vec4 gColor;layout(location=1)out vec4 gBloom;void main(){gColor=vec4(fkHoverColor,fkHoverOpacity);gBloom=vec4(0.0,0.0,0.0,fkHoverOpacity);}"});
+      state.outline=outline;state.line=new api.LineSegments(geometry,material);state.line.name="Krita brush hover";state.line.renderOrder=100000;state.line.frustumCulled=false;
+      mesh.add(state.line);updateHover(mesh,state);api.redraw?.();
+    }).catch(error=>{if(state.generation===generation){releaseHover(state);fail(error);}});
+  }
+  function hoverEnd(mesh){const state=hoverStates.get(mesh);if(state){releaseHover(state);hoverStates.delete(mesh);mesh.removeEventListener("removed",state.removed);}if(mesh)mesh.visible=false;}
   function attachSelection(Manager){
     for(const name of ["applyMatrix","resetMatrix"]){const original=Manager.prototype[name];if(typeof original!=="function")continue;
       Manager.prototype[name]=function(...args){const result=original.apply(this,args);for(const record of states.get(this)?.records.values()||[])record.syncVisibility();return result;};
@@ -452,6 +568,6 @@
   }
   function savePreset(id,shape){post({command:"savePreset",id,shape}).catch(fail);}
   async function selectPreset(id,shape){try{const result=await checked({command:"selectPreset",id,shape});if(result.bindings)setBindings(result.bindings);}catch(error){fail(error);}}
-  root.FeatherKrita={attach,attachSelection,setBindings,preview,birth,inherit,savePreset,selectPreset};
-  if(typeof module!=="undefined")module.exports={strokeRequest,coverageRectangles,mapPixel,SHAPES};
+  root.FeatherKrita={attach,attachSelection,setBindings,preview,hover,hoverEnd,birth,inherit,savePreset,selectPreset};
+  if(typeof module!=="undefined")module.exports={strokeRequest,coverageRectangles,mapPixel,surfaceHeight,hoverPositions,SHAPES};
 })(globalThis);
