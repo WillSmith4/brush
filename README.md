@@ -52,6 +52,14 @@ the full preset dynamics come from the native stroke result. Preview startup
 does not depend on a timer firing while the Pencil is held down. Saved artwork
 continues to use the complete native result, with independent undo and editing.
 
+Feather densifies spline positions without densifying its source normals. The
+adapter resamples those normals before building live paint, preventing undefined
+values from aborting preview. For strokes contacting a curved Guide, paint uses
+the Guide's actual triangles and a local raster projection instead of tangent
+quads that can cut through the support. The contacted patch is saved with the
+stroke, so reopening it without the Guide preserves its surface. The provisional
+tip preview uses that same support while drawing. Existing PNG paint is retained.
+
 The native asynchronous render entry point prepares resources on Qt's owner
 thread, then waits for Krita and encodes output on a background queue. Completion
 and image cleanup return to the owner thread. Stroke files use a separate serial

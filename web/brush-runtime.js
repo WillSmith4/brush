@@ -45,6 +45,16 @@
   const unit = (a, fallback=[0,0,1]) => Math.hypot(...a)>1e-9 ? mul(a,1/Math.hypot(...a)) : [...fallback];
   const lerp = (a,b,t) => add(mul(a,1-t),mul(b,t));
   const clamp = (v,lo,hi) => Math.max(lo,Math.min(hi,v));
+  function normalAt(normals,index,count){
+    if(!normals?.length)return {x:0,y:0,z:1};
+    const f=clamp(index/Math.max(1,count-1),0,1)*(normals.length-1),i=Math.floor(f);
+    const read=j=>{const p=normals[j];return p&&xyz(p).every(Number.isFinite)?xyz(p):null;};
+    let a=read(i),b=read(Math.min(i+1,normals.length-1));
+    if(!a&&!b){for(let j=0;j<normals.length&&!a;j++)a=read(j);}
+    a=a||b||[0,0,1];b=b||a;
+    const n=unit(lerp(a,b,f-i));
+    return {x:n[0],y:n[1],z:n[2]};
+  }
 
   // One isotropic projection, not arc-length UVs wrapped around a host tube.
   // A nonplanar path is lifted back onto its local drawing surface at mesh time.
@@ -102,6 +112,67 @@
     throw new Error("The brush footprint is too complex.");
   }
   const segmentTrees=new WeakMap();
+  const guideGeometryCache=new WeakMap(),guideDirty=new WeakSet();
+  function guideTriangles(mesh){
+    mesh.updateWorldMatrix(true,false);
+    const geometry=mesh.geometry,position=geometry?.attributes.position,index=geometry?.index;
+    if(!position||position.isInterleavedBufferAttribute)return null;
+    const key=[geometry.uuid,position.version,index?.version,mesh.matrixWorld.elements.join(",")].join(":");
+    const cached=guideGeometryCache.get(mesh);if(cached?.key===key)return cached.triangles;
+    const triangles=[],count=index?index.count:position.count;
+    if(count>600000)return null;
+    const point=i=>new api.Vector3().fromBufferAttribute(position,index?index.getX(i):i).applyMatrix4(mesh.matrixWorld).toArray();
+    for(let i=0;i+2<count;i+=3){const a=point(i),b=point(i+1),c=point(i+2),normal=unit(cross(sub(b,a),sub(c,a)));triangles.push({points:[a,b,c],normal});}
+    guideGeometryCache.set(mesh,{key,triangles});return triangles;
+  }
+  function guideSurface(frame,attributes){
+    if(!api?.guideMeshes||!api.Raycaster||!api.Vector3||attributes.points.length<2)return null;
+    const guides=api.guideMeshes()||[];if(!guides.length)return null;
+    guides.forEach(guide=>guide.updateWorldMatrix(true,true));
+    const ray=new api.Raycaster(),size=attributes.size||frame.size,offset=Math.max(size*2,.01),votes=new Map();
+    for(const i of [...new Set([0,Math.floor((attributes.points.length-1)/2),attributes.points.length-1])]){
+      const p=new api.Vector3(...xyz(attributes.points[i])),n=new api.Vector3(...xyz(normalAt(attributes.normals,i,attributes.points.length)));
+      ray.set(p.clone().addScaledVector(n,offset),n.clone().negate());ray.far=offset*2;
+      const hit=ray.intersectObjects(guides,true).find(h=>h.object.isMesh&&h.point.distanceTo(p)<=Math.max(size*.4,.002));
+      if(hit)votes.set(hit.object,(votes.get(hit.object)||0)+1);
+    }
+    const chosen=[...votes].sort((a,b)=>b[1]-a[1])[0];if(!chosen||chosen[1]<2)return null;
+    const triangles=guideTriangles(chosen[0]);if(!triangles)return null;
+    const positions=[],normals=[],uv=[];
+    for(const triangle of triangles){
+      // Only the contacted side of the Guide receives this raster projection.
+      if(dot(triangle.normal,frame.normal)<=.02)continue;
+      const coords=triangle.points.map(p=>{const d=sub(p,frame.origin);return [(dot(d,frame.u)-frame.minX)*frame.scale/frame.width,(dot(d,frame.v)-frame.minY)*frame.scale/frame.height];});
+      if(Math.max(...coords.map(p=>p[0]))<0||Math.min(...coords.map(p=>p[0]))>1||Math.max(...coords.map(p=>p[1]))<0||Math.min(...coords.map(p=>p[1]))>1)continue;
+      for(let i=0;i<3;i++){positions.push(...triangle.points[i]);normals.push(...triangle.normal);uv.push(...coords[i]);}
+    }
+    return positions.length?{version:1,positions,normals,uv}:null;
+  }
+  function guidePaintGeometry(source,info,record,attributes,patch){
+    const geometry=new api.Geometry(),count=patch.positions.length/3,frame=record.frame;
+    const current={points:attributes.points.map(xyz),normals:(attributes.normals||[]).map(xyz)},original={points:record.attributes.points.map(xyz),normals:(record.attributes.normals||[]).map(xyz)};
+    const unchanged=attributes.size===record.attributes.size&&current.points.length===original.points.length&&current.points.every((p,i)=>p.every((v,j)=>v===original.points[i][j]));
+    const positions=new Float32Array(patch.positions),normals=new Float32Array(patch.normals),progress=new Float32Array(count);
+    for(let i=0;i<count;i++){
+      const x=patch.uv[i*2]*frame.width,y=(1-patch.uv[i*2+1])*frame.height,location=locate(frame,x,y);progress[i]=location.progress;
+      if(!unchanged){const to=mapPixel(frame,x,y,attributes,current),from=mapPixel(frame,x,y,record.attributes,original);positions.set(add(patch.positions.slice(i*3,i*3+3),sub(to.position,from.position)),i*3);normals.set(to.normal,i*3);}
+    }
+    for(const [name,attribute]of Object.entries(source.attributes)){
+      if(name==="fkHide")continue;
+      const array=new attribute.array.constructor(count*attribute.itemSize);
+      for(let i=0;i<count;i++){
+        const offset=(info.geomAttributes+Math.min(info.numOfPoints-1,Math.round(progress[i]*(info.numOfPoints-1)))*4)*attribute.itemSize;
+        for(let j=0;j<attribute.itemSize;j++)array[i*attribute.itemSize+j]=attribute.array[offset+j]||0;
+        if(name==="position")array.set(positions.subarray(i*3,i*3+3),i*3);
+        else if(name==="normalUp"||name==="normalSide")array.set(normals.subarray(i*3,i*3+3),i*3);
+        else if(name==="upDown")array[i]=0;
+        else if(name==="color")array.set([...(attributes.color||[0,0,0]).slice(0,3),Math.round((attributes.color?.[3]??1)*255)],i*4);
+      }
+      geometry.setAttribute(name,new api.Attribute(array,attribute.itemSize,attribute.normalized));
+    }
+    geometry.setAttribute("fkUV",new api.Attribute(new Float32Array(patch.uv),2));
+    geometry.setIndex(new api.Attribute(Uint32Array.from({length:count},(_,i)=>i),1));geometry.computeBoundingSphere();return geometry;
+  }
   function segmentTree(frame) {
     if(segmentTrees.has(frame))return segmentTrees.get(frame);
     const parts=frame.projected.slice(0,-1).map((p,i)=>{const q=frame.projected[i+1];return {i,minX:Math.min(p[0],q[0]),maxX:Math.max(p[0],q[0]),minY:Math.min(p[1],q[1]),maxY:Math.max(p[1],q[1])};});
@@ -350,6 +421,7 @@
     const match="vec4 diffuseColor = vColor;";
     if(!original.fragmentShader.includes(match))throw new Error("Unsupported Feather stroke material.");
     material.fragmentShader="varying vec2 fkTexCoord;\nuniform sampler2D fkBrush;\nuniform sampler2D fkCoverage;\nuniform vec4 fkBaseColor;\n"+original.fragmentShader.replace(match,
+      "if (any(lessThan(fkTexCoord, vec2(0.0))) || any(greaterThan(fkTexCoord, vec2(1.0)))) discard;\n"+
       "if (texture2D(fkCoverage, fkTexCoord).a < 0.5) discard;\n"+
       "vec4 fkSample = texture2D(fkBrush, fkTexCoord);\n"+
       "fkSample.rgb = clamp(fkSample.rgb + vColor.rgb - fkBaseColor.rgb, 0.0, 1.0);\n"+
@@ -388,6 +460,13 @@
     return Number.isFinite(height)&&z<0.999999&&Math.abs(height-baseHeight)<=frame.size*2?height:null;
   }
   async function surfaceGeometry(source,info,record,entry,attributes) {
+    // Match the support's actual triangles instead of joining tangent-plane
+    // rectangles by chords that cut through a curved Guide. Persist only this
+    // local patch so hiding/deleting the Guide does not reshape finished paint.
+    if(!entry.depth){
+      if(!record.guideSurface){const patch=guideSurface(record.frame,record.attributes);if(patch){record.guideSurface=patch;guideDirty.add(record);}}
+      if(record.guideSurface)return guidePaintGeometry(source,info,record,attributes,record.guideSurface);
+    }
     const {frame}=record,rectangles=[];
     const tile=entry.depth?8:32;
     for(const [x0,y0,x1,y1] of entry.rectangles)for(let y=y0;y<y1;y+=tile)for(let x=x0;x<x1;x+=tile){const r=[x,y,Math.min(x+tile,x1),Math.min(y+tile,y1)];rectangles.push({r,progress:locate(frame,(r[0]+r[2])/2,(r[1]+r[3])/2).progress});}
@@ -469,6 +548,7 @@
     };
     syncVisibility();manager.sceneGroup.add(mesh);
     hideCurve(manager,info,state,id);state.records.set(id,{mesh,entry,syncVisibility,info,source:geom.geometry});evict();api.redraw?.();
+    if(guideDirty.has(record)&&!record.preview){guideDirty.delete(record);save(id,record).catch(fail);}
   }
   function register(manager){if(!states.has(manager)){states.set(manager,{depth:0,generation:0,records:new Map(),hidden:new Map(),pending:new Map(),dirty:new Set()});managers.add(manager);}return states.get(manager);}
   function synchronize(manager) {
@@ -622,9 +702,46 @@
   }
   function clearFastPreview(holder){
     if(holder.fast){holder.fast.removeFromParent();holder.fast.geometry.dispose();holder.fast.material.dispose();holder.fast=null;holder.fastEntry.refs--;holder.fastEntry=null;}
+    for(const texture of holder.fastTextures||[])texture.dispose();holder.fastTextures=null;holder.fastGuideCanvas=null;
+  }
+  function fastGuidePreview(mesh,holder,attributes,preset,item){
+    const request=strokeRequest(attributes,preset,api.fallbackSize,{preview:true},cameraRight()),frame=request.frame;
+    const patch=guideSurface(frame,attributes);if(!patch)return false;
+    const entry=item.entry,color=tipColor(attributes),tip=item.record.frame,size=attributes.size||api.fallbackSize;
+    if(holder.fastEntry!==entry||!holder.fastGuideCanvas){
+      clearFastPreview(holder);
+      const canvas=document.createElement("canvas"),mask=document.createElement("canvas");mask.width=mask.height=1;
+      const context=mask.getContext("2d");context.fillStyle="white";context.fillRect(0,0,1,1);
+      const texture=new api.Texture(canvas),coverage=new api.Texture(mask);
+      for(const t of [texture,coverage]){t.generateMipmaps=false;t.minFilter=api.LinearFilter;t.magFilter=api.LinearFilter;t.needsUpdate=true;}
+      const material=materialFor(mesh.material,{texture,mask:coverage},color,size);
+      holder.fast=new api.Mesh(new api.Geometry(),material);holder.fast.name="Krita guide tip preview";holder.fast.userData.fkLiveTip=true;
+      holder.fast.renderOrder=Number.MAX_SAFE_INTEGER-2;holder.fast.frustumCulled=false;holder.fast.matrixAutoUpdate=false;
+      holder.fastEntry=entry;entry.refs++;holder.fastGuideCanvas=canvas;holder.fastTextures=[texture,coverage];mesh.parent.add(holder.fast);
+    }
+    const canvas=holder.fastGuideCanvas;canvas.width=frame.width;canvas.height=frame.height;
+    const context=canvas.getContext("2d"),points=frame.points,distances=[0];
+    for(let i=1;i<points.length;i++)distances.push(distances[i-1]+Math.hypot(...sub(points[i],points[i-1])));
+    const length=distances.at(-1),count=Math.min(2048,Math.max(2,Math.ceil(length/Math.max(size*.15,1e-8))+1));let segment=0;
+    for(let i=0;i<count;i++){
+      const d=length*i/(count-1);while(segment<points.length-2&&distances[segment+1]<d)segment++;
+      const f=clamp((d-distances[segment])/(distances[segment+1]-distances[segment]||1),0,1),p=lerp(frame.projected[segment],frame.projected[segment+1]||frame.projected[segment],f);
+      const pressure=attributes.pressures?.length?clamp((attributes.pressures[segment]??1)*(1-f)+(attributes.pressures[segment+1]??1)*f,0,1):1;
+      const scale=size*frame.scale*pressure;
+      if(scale>0)context.drawImage(entry.texture.image,(p[0]-frame.minX)*frame.scale+tip.minX*scale,(frame.maxY-p[1])*frame.scale-tip.maxY*scale,(tip.maxX-tip.minX)*scale,(tip.maxY-tip.minY)*scale);
+    }
+    holder.fastTextures[0].needsUpdate=true;
+    const record={frame,attributes},info={numOfPoints:points.length,geomAttributes:0};
+    const geometry=guidePaintGeometry(mesh.geometry,info,record,attributes,patch);holder.fast.geometry.dispose();holder.fast.geometry=geometry;
+    holder.fast.matrix.copy(mesh.matrix);holder.fast.matrixWorldNeedsUpdate=true;holder.fast.visible=true;
+    holder.fast.onBeforeRender=()=>syncUniforms(mesh.material,holder.fast.material);
+    for(const r of states.get(holder.manager).records.values())r.mesh.visible=false;
+    api.redraw?.();return true;
   }
   function fastPreview(mesh,holder,attributes,preset){
     const item=tipCache.get(tipKey(attributes,preset));if(!item?.entry||!item.entry.rectangles.length)return false;
+    if(fastGuidePreview(mesh,holder,attributes,preset,item))return true;
+    if(holder.fastGuideCanvas)clearFastPreview(holder);
     const entry=item.entry,frame=item.record.frame,points=attributes.points.map(xyz),normals=(attributes.normals||[]).map(xyz),size=attributes.size||api.fallbackSize;
     const distances=[0];for(let i=1;i<points.length;i++)distances.push(distances[i-1]+Math.hypot(...sub(points[i],points[i-1])));
     const length=distances.at(-1),step=Math.max(size*.15,length/2047,1e-8),count=Math.min(2048,Math.max(2,Math.ceil(length/step)+1));
@@ -708,6 +825,6 @@
   }
   function savePreset(id,shape){post({command:"savePreset",id,shape}).catch(fail);}
   async function selectPreset(id,shape){try{const result=await checked({command:"selectPreset",id,shape});if(result.bindings)setBindings(result.bindings);}catch(error){fail(error);}}
-  root.FeatherKrita={attach,attachSelection,setBindings,preview,pressureInput,hover,hoverEnd,birth,inherit,savePreset,selectPreset};
-  if(typeof module!=="undefined")module.exports={strokeRequest,coverageRectangles,mapPixel,surfaceHeight,hoverPositions,SHAPES};
+  root.FeatherKrita={attach,attachSelection,setBindings,preview,pressureInput,normalAt,hover,hoverEnd,birth,inherit,savePreset,selectPreset};
+  if(typeof module!=="undefined")module.exports={strokeRequest,coverageRectangles,mapPixel,surfaceHeight,hoverPositions,normalAt,SHAPES};
 })(globalThis);
