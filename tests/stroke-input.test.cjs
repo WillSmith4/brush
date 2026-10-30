@@ -34,7 +34,8 @@ test('six verified identifiers remain selectable; malformed geometry is rejected
 test('live and completed rendering share the same world-space diameter and pressure',()=>{
  const attributes={points:[{x:0,y:0,z:0},{x:1,y:0,z:0}],size:.2,color:[10,20,30,1],pressures:[.4,1]};
  const live=strokeRequest(attributes,'preset',.01,{preview:true}),final=strokeRequest(attributes,'preset');
- assert.ok(live.body.width*live.body.height<=260000);
+ assert.deepEqual(live.body,final.body);
+ assert.deepEqual(live.frame,final.frame);
  assert.ok(Math.abs(live.body.size/live.frame.scale-attributes.size)<1e-10);
  assert.ok(Math.abs(final.body.size/final.frame.scale-attributes.size)<1e-10);
  assert.deepEqual(live.body.points.map(p=>p[2]),final.body.points.map(p=>p[2]));

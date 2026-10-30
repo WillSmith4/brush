@@ -45,26 +45,25 @@ small surface separation in that shader instead of relying on polygon offset.
 This prevents a single stroke from fighting its drawing support. The depth bias
 is disabled during smudge capture and restored afterward.
 
-Selecting or hovering an injected brush warms a small native-rendered tip cache.
-Pencil events can display a textured tip trail synchronously while the exact
-native stroke is still rendering. The fast tip trail is a provisional preview;
-the full preset dynamics come from the native stroke result. Preview startup
-does not depend on a timer firing while the Pencil is held down. Saved artwork
-continues to use the complete native result, with independent undo and editing.
+Live preview uses the full native brush renderer at the same pixel density,
+point sampling, size, opacity, pressure, seed, and resource settings as committed
+paint. It retains the last completed native image while coalescing new Pencil
+input. It does not approximate the preset by repeating a single cached tip.
+Updates remain asynchronous; complex presets can lag behind the latest Pencil
+position while their full native result is computed.
 
 Feather densifies spline positions without densifying its source normals. The
 adapter resamples those normals before building live paint, preventing undefined
 values from aborting preview. For strokes contacting a curved Guide, paint uses
 the Guide's actual triangles and a local raster projection instead of tangent
 quads that can cut through the support. The contacted patch is saved with the
-stroke, so reopening it without the Guide preserves its surface. The provisional
-tip preview uses that same support while drawing. Existing PNG paint is retained.
+stroke, so reopening it without the Guide preserves its surface. Native preview
+uses that same support while drawing. Existing PNG paint is retained.
 
-The live Guide canvas reserves GPU texture capacity instead of resizing an
-already-uploaded texture. Growing beyond capacity creates a new texture and
-releases the old one; shrinking reuses the allocation. UVs map the active frame
-into the reserved canvas, preserving world-space brush scale and avoiding stale,
-stretched images during successive Pencil updates.
+Each completed native preview owns its raster image and the corresponding
+geometry. A newer partial path never stretches an older result. The original
+raw surface normals are retained alongside densified preview normals so both
+preview and committed paint construct the same raster frame.
 
 The native asynchronous render entry point prepares resources on Qt's owner
 thread, then waits for Krita and encodes output on a background queue. Completion

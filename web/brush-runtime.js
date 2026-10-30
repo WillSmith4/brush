@@ -8,7 +8,6 @@
   const artworks = new Map(), metadata = new Map(), assets = new Map(), previews = new WeakMap();
   const restoringSurfaces = new Set();
   const hoverStates=new Map();
-  const tipCache=new Map();
   const paintOrders=new Map();let lastPaintOrder=0,legacyPaintOrder=0;
   function paintOrder(id,saved){
     // Loaded records may arrive out of document order. A persisted layer order
@@ -74,7 +73,7 @@
     for(const p of projected){minX=Math.min(minX,p[0]);minY=Math.min(minY,p[1]);maxX=Math.max(maxX,p[0]);maxY=Math.max(maxY,p[1]);}
     minX-=margin;minY-=margin;maxX+=margin;maxY+=margin;
     const w=maxX-minX,h=maxY-minY;
-    const scale=Math.min((meta.preview?64:128)/size,4094/w,4094/h,Math.sqrt((meta.preview?260000:2090000)/(w*h)))*0.999;
+    const scale=Math.min(128/size,4094/w,4094/h,Math.sqrt(2090000/(w*h)))*0.999;
     const width=Math.max(2,Math.ceil(w*scale)),height=Math.max(2,Math.ceil(h*scale));
     maxX=minX+width/scale;minY=maxY-height/scale;
     const pressures=attributes.pressures || [];
@@ -338,11 +337,11 @@
     if(rendering.has(record))return rendering.get(record);
     const job=renderTail.then(async()=>{
       if(!active())return null;
-      const meta={...await presetInfo(record.preset),preview:!!record.preview};
+      const meta={...await presetInfo(record.preset)};
       if(meta.engine==="mypaintbrush")meta.samplesBackdrop=true;
       if(!active())return null;
       const request=strokeRequest(record.attributes,record.preset,api.fallbackSize,meta,cameraRight());
-      if(meta.samplesBackdrop&&!record.tip){
+      if(meta.samplesBackdrop){
         // Batch-buffer compaction temporarily removes replacement meshes. Wait
         // for saved paint to return before sampling another brush's substrate.
         await Promise.resolve();await Promise.all([...restoringSurfaces]);
@@ -602,7 +601,6 @@
   function setBindings(next){
     bindings=Object.fromEntries(Object.entries(next).filter(([shape,id])=>SHAPES.includes(shape)&&typeof id==="string"));
     for(const [mesh,state] of hoverStates)hover(mesh,state.attributes,state.distance);
-    const brush=api?.currentBrush?.();if(brush&&bindings[brush.shape])warmTip(brush).catch(fail);
   }
   function hoverPositions(polygons,size,u=[1,0,0],v=[0,0,-1]){
     const positions=[];
@@ -651,7 +649,6 @@
       mesh.addEventListener("removed",state.removed);}
     state.attributes=attributes;state.distance=distance;
     const preset=bindings[attributes.shape];
-    if(preset)warmTip(attributes).catch(fail);
     if(!preset){releaseHover(state);api.redraw?.();return;}
     if(state.preset===preset){updateHover(mesh,state);return;}
     releaseHover(state);state.preset=preset;const generation=state.generation;
@@ -682,119 +679,12 @@
       return clamp(pressures[j]*(1-(f-j))+(pressures[Math.min(j+1,pressures.length-1)]||0)*(f-j),0,1);
     });
   }
-  function tipColor(attributes){const color=attributes.color||[0,0,0];return [...color.slice(0,3),attributes.opacity??color[3]??1];}
-  function tipKey(attributes,preset){return JSON.stringify([preset,tipColor(attributes)]);}
-  function warmTip(attributes){
-    const preset=(gesture?.bindings||bindings)[attributes.shape];if(!preset)return Promise.resolve(null);
-    const key=tipKey(attributes,preset);if(tipCache.has(key))return tipCache.get(key).promise;
-    const item={entry:null,record:null};tipCache.set(key,item);
-    item.promise=(async()=>{
-      const a={shape:attributes.shape,size:1,color:tipColor(attributes),points:[{x:0,y:0,z:0}],normals:[{x:0,y:0,z:1}],pressures:[1]};
-      const record={version:2,preset,preview:true,tip:true,attributes:a};
-      await renderRecord(null,record);const entry=await loadAssets(record);entry.refs++;
-      item.entry=entry;item.record=record;
-      // Small, bounded cache. A brush texture is computed before contact from
-      // the actual preset; it is not the substituted Feather tube.
-      while(tipCache.size>8){const oldest=tipCache.keys().next().value;if(oldest===key)break;const old=tipCache.get(oldest);if(!old.entry)break;old.entry.refs--;tipCache.delete(oldest);}
-      evict();return item;
-    })().catch(error=>{tipCache.delete(key);throw error;});
-    return item.promise;
-  }
-  function clearFastPreview(holder){
-    if(holder.fast){holder.fast.removeFromParent();holder.fast.geometry.dispose();holder.fast.material.dispose();holder.fast=null;holder.fastEntry.refs--;holder.fastEntry=null;}
-    for(const texture of holder.fastTextures||[])texture.dispose();holder.fastTextures=null;holder.fastGuideCanvas=null;
-  }
-  function fastGuidePreview(mesh,holder,attributes,preset,item){
-    const request=strokeRequest(attributes,preset,api.fallbackSize,{preview:true},cameraRight()),frame=request.frame;
-    const patch=guideSurface(frame,attributes);if(!patch)return false;
-    const entry=item.entry,color=tipColor(attributes),tip=item.record.frame,size=attributes.size||api.fallbackSize;
-    if(holder.fastEntry!==entry||!holder.fastGuideCanvas){
-      clearFastPreview(holder);
-      const canvas=document.createElement("canvas"),mask=document.createElement("canvas");mask.width=mask.height=1;
-      canvas.width=2**Math.ceil(Math.log2(frame.width));canvas.height=2**Math.ceil(Math.log2(frame.height));
-      const context=mask.getContext("2d");context.fillStyle="white";context.fillRect(0,0,1,1);
-      const texture=new api.Texture(canvas),coverage=new api.Texture(mask);
-      for(const t of [texture,coverage]){t.generateMipmaps=false;t.minFilter=api.LinearFilter;t.magFilter=api.LinearFilter;t.needsUpdate=true;}
-      const material=materialFor(mesh.material,{texture,mask:coverage},color,size);
-      holder.fast=new api.Mesh(new api.Geometry(),material);holder.fast.name="Krita guide tip preview";holder.fast.userData.fkLiveTip=true;
-      holder.fast.renderOrder=Number.MAX_SAFE_INTEGER-2;holder.fast.frustumCulled=false;holder.fast.matrixAutoUpdate=false;
-      holder.fastEntry=entry;entry.refs++;holder.fastGuideCanvas=canvas;holder.fastTextures=[texture,coverage];mesh.parent.add(holder.fast);
-    }
-    let canvas=holder.fastGuideCanvas;
-    if(frame.width>canvas.width||frame.height>canvas.height){
-      // WebGL2 texture storage is immutable after its first upload. Updating a
-      // larger canvas through needsUpdate leaves the old GPU image in place.
-      // Grow capacity geometrically and replace the GPU texture atomically.
-      const grown=document.createElement("canvas");
-      grown.width=Math.max(canvas.width,2**Math.ceil(Math.log2(frame.width)));
-      grown.height=Math.max(canvas.height,2**Math.ceil(Math.log2(frame.height)));
-      const texture=new api.Texture(grown);texture.generateMipmaps=false;texture.minFilter=api.LinearFilter;texture.magFilter=api.LinearFilter;
-      const previous=holder.fastTextures[0];holder.fastTextures[0]=texture;
-      holder.fast.material.uniforms.fkBrush.value=texture;
-      holder.fastGuideCanvas=grown;canvas=grown;previous.dispose();
-    }
-    const context=canvas.getContext("2d"),points=frame.points,distances=[0];
-    context.clearRect(0,0,canvas.width,canvas.height);
-    for(let i=1;i<points.length;i++)distances.push(distances[i-1]+Math.hypot(...sub(points[i],points[i-1])));
-    const length=distances.at(-1),count=Math.min(2048,Math.max(2,Math.ceil(length/Math.max(size*.15,1e-8))+1));let segment=0;
-    for(let i=0;i<count;i++){
-      const d=length*i/(count-1);while(segment<points.length-2&&distances[segment+1]<d)segment++;
-      const f=clamp((d-distances[segment])/(distances[segment+1]-distances[segment]||1),0,1),p=lerp(frame.projected[segment],frame.projected[segment+1]||frame.projected[segment],f);
-      const pressure=attributes.pressures?.length?clamp((attributes.pressures[segment]??1)*(1-f)+(attributes.pressures[segment+1]??1)*f,0,1):1;
-      const scale=size*frame.scale*pressure;
-      if(scale>0)context.drawImage(entry.texture.image,(p[0]-frame.minX)*frame.scale+tip.minX*scale,(frame.maxY-p[1])*frame.scale-tip.maxY*scale,(tip.maxX-tip.minX)*scale,(tip.maxY-tip.minY)*scale);
-    }
-    holder.fastTextures[0].needsUpdate=true;
-    const record={frame,attributes},info={numOfPoints:points.length,geomAttributes:0};
-    const geometry=guidePaintGeometry(mesh.geometry,info,record,attributes,patch);
-    // Paint occupies the top-left frame rectangle within the reserved canvas.
-    // Keep world-to-pixel scale exact even when the stroke shrinks or bends.
-    const uv=geometry.attributes.fkUV.array,sx=frame.width/canvas.width,sy=frame.height/canvas.height;
-    for(let i=0;i<uv.length;i+=2){uv[i]*=sx;uv[i+1]=1-(1-uv[i+1])*sy;}
-    holder.fast.geometry.dispose();holder.fast.geometry=geometry;
-    holder.fast.matrix.copy(mesh.matrix);holder.fast.matrixWorldNeedsUpdate=true;holder.fast.visible=true;
-    holder.fast.onBeforeRender=()=>syncUniforms(mesh.material,holder.fast.material);
-    for(const r of states.get(holder.manager).records.values())r.mesh.visible=false;
-    api.redraw?.();return true;
-  }
-  function fastPreview(mesh,holder,attributes,preset){
-    const item=tipCache.get(tipKey(attributes,preset));if(!item?.entry||!item.entry.rectangles.length)return false;
-    if(fastGuidePreview(mesh,holder,attributes,preset,item))return true;
-    if(holder.fastGuideCanvas)clearFastPreview(holder);
-    const entry=item.entry,frame=item.record.frame,points=attributes.points.map(xyz),normals=(attributes.normals||[]).map(xyz),size=attributes.size||api.fallbackSize;
-    const distances=[0];for(let i=1;i<points.length;i++)distances.push(distances[i-1]+Math.hypot(...sub(points[i],points[i-1])));
-    const length=distances.at(-1),step=Math.max(size*.15,length/2047,1e-8),count=Math.min(2048,Math.max(2,Math.ceil(length/step)+1));
-    const positions=new Float32Array(count*12),up=new Float32Array(count*12),uv=new Float32Array(count*8),colors=new Uint8Array(count*16),indices=new Uint32Array(count*6),right=cameraRight(),color=tipColor(attributes);
-    let segment=0;
-    for(let i=0;i<count;i++){
-      const d=length*i/(count-1);while(segment<points.length-2&&distances[segment+1]<d)segment++;
-      const f=clamp((d-distances[segment])/(distances[segment+1]-distances[segment]||1),0,1),center=lerp(points[segment],points[segment+1]||points[segment],f);
-      const n=unit(lerp(normals[segment]||frame.normal,normals[segment+1]||normals[segment]||frame.normal,f));
-      const u=unit(sub(right,mul(n,dot(right,n))),frame.u),v=unit(cross(n,u),frame.v);
-      const pressure=attributes.pressures?.length?clamp((attributes.pressures[segment]??1)*(1-f)+(attributes.pressures[segment+1]??1)*f,0,1):1;
-      const corners=[[frame.minX,frame.maxY,0,1],[frame.maxX,frame.maxY,1,1],[frame.maxX,frame.minY,1,0],[frame.minX,frame.minY,0,0]];
-      corners.forEach(([x,y,tx,ty],j)=>{positions.set(add(center,add(mul(u,x*size*pressure),mul(v,y*size*pressure))),i*12+j*3);up.set(n,i*12+j*3);uv.set([tx,ty],i*8+j*2);colors.set([...color.slice(0,3),Math.round(color[3]*255)],i*16+j*4);});
-      indices.set([i*4,i*4+2,i*4+1,i*4,i*4+3,i*4+2],i*6);
-    }
-    if(holder.fastEntry!==entry){clearFastPreview(holder);const material=materialFor(mesh.material,entry,color,size);const geometry=new api.Geometry();holder.fast=new api.Mesh(geometry,material);holder.fast.name="Krita immediate tip preview";holder.fast.userData.fkLiveTip=true;holder.fast.renderOrder=Number.MAX_SAFE_INTEGER-2;holder.fast.frustumCulled=false;holder.fast.matrixAutoUpdate=false;holder.fastEntry=entry;entry.refs++;mesh.parent.add(holder.fast);}
-    if(holder.fast.material.uniforms.fkDepthBias)holder.fast.material.uniforms.fkDepthBias.value=size*0.005;
-    const geometry=holder.fast.geometry;
-    const set=(name,array,size)=>{const old=geometry.attributes[name];if(old&&old.array.length===array.length){old.array.set(array);old.needsUpdate=true;}else geometry.setAttribute(name,new api.Attribute(array,size));};
-    set("position",positions,3);set("fkUV",uv,2);set("color",colors,4);
-    set("normalUp",up,3);set("normalSide",up,3);set("upDown",new Float32Array(count*4),1);
-    if(mesh.geometry.attributes.properties){const p=new Float32Array(count*12);for(let i=0;i<count*4;i++)p.set(mesh.geometry.attributes.properties.array.subarray(0,3),i*3);set("properties",p,3);}
-    if(mesh.geometry.attributes.intensity)set("intensity",new Float32Array(count*4).fill(mesh.geometry.attributes.intensity.array[0]),1);
-    geometry.setIndex(new api.Attribute(indices,1));holder.fast.matrix.copy(mesh.matrix);holder.fast.matrixWorldNeedsUpdate=true;holder.fast.visible=true;
-    holder.fast.onBeforeRender=()=>syncUniforms(mesh.material,holder.fast.material);
-    for(const record of states.get(holder.manager).records.values())record.mesh.visible=false;
-    api.redraw?.();return true;
-  }
   function preview(mesh,attributes) {
     if(!attached||!mesh?.parent)return;
     let holder=previews.get(mesh);
     const stop=!mesh.geometry.drawRange.count||!attributes.shape;
     if(stop){
-      if(holder){holder.epoch++;clearTimeout(holder.timer);holder.timer=null;holder.latest=null;clearFastPreview(holder);clearState(states.get(holder.manager));holder.manager.curveIdToGeomInfo.clear();}
+      if(holder){holder.epoch++;clearTimeout(holder.timer);holder.timer=null;holder.latest=null;clearState(states.get(holder.manager));holder.manager.curveIdToGeomInfo.clear();}
       gesture=null;return;
     }
     if(!gesture)gesture={bindings:{...bindings}};
@@ -802,39 +692,35 @@
     if(!holder){
       const manager={sceneGroup:mesh.parent,curveIdToGeomInfo:new Map(),getGeomFromInfo:()=>({geometry:mesh.geometry,mesh})};
       holder={manager,timer:null,latest:null,epoch:0,running:false,disposed:false};previews.set(mesh,holder);register(manager);
-      mesh.addEventListener("removed",()=>{holder.disposed=true;holder.epoch++;clearTimeout(holder.timer);clearFastPreview(holder);clearState(states.get(manager));managers.delete(manager);});
+      mesh.addEventListener("removed",()=>{holder.disposed=true;holder.epoch++;clearTimeout(holder.timer);clearState(states.get(manager));managers.delete(manager);});
     }
     const count=attributes.points?.length || 0;
     if(count<2)return;
     const state=states.get(holder.manager);
-    // Hide the Feather tube immediately. Retain the last completed Krita
-    // texture while a newer Pencil sample is being rendered.
+    // Display only full native stroke results. Keep the last completed image
+    // visible while the next whole-path render is running; never replace it with
+    // independently stamped tips or stretch it to a newer path's bounds.
     const mask=maskSource(mesh.geometry,mesh.material);mask.array.fill(1);mask.needsUpdate=true;
     state.hidden.set("preview",{source:mesh.geometry,mask,offset:0,count:mask.count});
     holder.latest={attributes,preset,indexCount:mesh.geometry.drawRange.count};
-    holder.lastAttributes=attributes;holder.revision=(holder.revision||0)+1;
-    if(!fastPreview(mesh,holder,attributes,preset)){
-      const epoch=holder.epoch;
-      warmTip(attributes).then(()=>{if(holder.epoch===epoch&&!holder.disposed&&mesh.geometry.drawRange.count)fastPreview(mesh,holder,holder.lastAttributes,preset);}).catch(fail);
-    }
     const run=async()=>{
       holder.timer=null;if(holder.running||holder.disposed||!holder.latest)return;
       const latest=holder.latest;holder.latest=null;holder.running=true;
-      const epoch=holder.epoch,revision=holder.revision,active=()=>!holder.disposed&&epoch===holder.epoch&&!!mesh.parent;
+      const epoch=holder.epoch,active=()=>!holder.disposed&&epoch===holder.epoch&&!!mesh.parent;
       try{
-        const a=clone(latest.attributes),record={version:2,preset:latest.preset,preview:true,attributes:a};
+        const a=clone(latest.attributes);
+        // The host keeps raw normals separate from densified positions. Use the
+        // same raw normals as its committed stroke when constructing the native
+        // raster frame; the renderer handles their interpolation for geometry.
+        if(a.renderNormals?.length)a.normals=a.renderNormals;
+        delete a.renderNormals;
+        const record={version:2,preset:latest.preset,preview:true,attributes:a};
         const rendered=await renderRecord(null,record,active);
         if(!rendered||!active())return;
         const entry=await loadAssets(record);if(!active())return;
         const info={attributes:a,numOfPoints:a.points.length,geomAttributes:0,geomIndex:0,fkIndexCount:latest.indexCount};
         holder.manager.curveIdToGeomInfo.set("preview",info);
         await replaceCurve(holder.manager,state,"preview",info,record,entry,a,active);
-        if(active()){
-          // Keep the fast tip trail if it already includes newer Pencil input.
-          const exact=state.records.get("preview")?.mesh;
-          if(holder.fast&&holder.revision!==revision){if(exact)exact.visible=false;}
-          else if(holder.fast)holder.fast.visible=false;
-        }
       }catch(error){fail(error);}finally{
         holder.running=false;
         if(holder.latest&&!holder.disposed)queueMicrotask(run);

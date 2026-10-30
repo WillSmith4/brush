@@ -23,7 +23,7 @@ function fixture(store=new Map(),deferRender,deferOutline){
    if(body.command==='selectPreset')return {ok:true,bindings:{RECT:'saved'}};
    if(body.command==='render'){
     if(deferRender)await deferRender;
-    const png=Buffer.from(JSON.stringify({width:body.width,height:body.height,tip:body.preset})).toString('base64');
+    const png=Buffer.from(JSON.stringify({width:body.width,height:body.height,tip:body.preset,input:JSON.stringify(body)})).toString('base64');
     return {ok:true,width:body.width,height:body.height,png,coverage:png,composited:false};
    }
    return {ok:true};
@@ -127,7 +127,7 @@ test('Pencil hover uses the imported outline, scales with brush size, and Restor
  f.fk.setBindings({});assert.equal(mesh.children.length,0);assert.ok(geometry.attributes.fkHide.array.every(x=>x===0));
  assert.deepEqual(Array.from(geometry.attributes.position.array),original);
  assert.equal(f.requests.filter(r=>r.command==='saveStroke').length,0);
- assert.ok(f.requests.filter(r=>r.command==='render').every(r=>r.points.length===1));
+ assert.equal(f.requests.filter(r=>r.command==='render').length,0);
 });
 
 test('switching injected presets changes the hover outline without changing the host tip',async()=>{
@@ -199,7 +199,7 @@ test('live Krita texture becomes visible before Pencil-up even with continuous i
  assert.ok(f.manager.sceneGroup.children.some(m=>m.geometry.attributes.fkUV));assert.deepEqual(f.errors,[]);
  // Only the in-flight render and newest queued update are needed, not 16 jobs.
  assert.ok(f.requests.filter(r=>r.command==='render'&&r.points.length>1).length<=2);
- assert.equal(f.requests.filter(r=>r.command==='render'&&r.points.length===1).length,1);
+ assert.equal(f.requests.filter(r=>r.command==='render'&&r.points.length===1).length,0);
  geometry.setDrawRange(0,0);f.fk.preview(mesh,{});await new Promise(r=>setTimeout(r,20));
  assert.ok(!f.manager.sceneGroup.children.some(m=>m.geometry.attributes.fkUV));
  assert.ok(geometry.attributes.fkHide.array.every(v=>v===0));
@@ -229,21 +229,34 @@ test('geometry construction yields to input and saving a completed stroke does n
  clearInterval(timer);releaseSave();assert.ok(heartbeats>1);assert.ok(f.manager.sceneGroup.children.some(m=>m.geometry.attributes.fkUV));assert.deepEqual(f.errors,[]);
 });
 
-test('a warmed native tip draws synchronously while timers and exact render replies are delayed',async()=>{
+test('native preview and committed paint receive identical render requests and show identical results',async()=>{
+ for(const preset of ['rect','masking-brush','charcoal-dynamics']){
+  const f=fixture();f.manager.makeCurve('live',f.attributes);await settled();const {mesh,geometry}=f.manager.getGeomFromInfo(f.manager.curveIdToGeomInfo.get('live'));geometry.setDrawRange(0,60);
+  f.fk.setBindings({RECT:preset});f.fk.preview(mesh,f.attributes);
+  for(let i=0;i<200&&!f.manager.sceneGroup.children.some(m=>m.geometry.attributes.fkUV);i++)await new Promise(r=>setTimeout(r,5));
+  const shown=f.manager.sceneGroup.children.find(m=>m.geometry.attributes.fkUV);assert.ok(shown);
+  const liveInput=shown.material.uniforms.fkBrush.value.image.input;
+  geometry.setDrawRange(0,0);f.fk.preview(mesh,{});f.draw('committed');await settled();
+  const completed=f.manager.sceneGroup.children.find(m=>m.geometry.attributes.fkUV);assert.ok(completed);
+  assert.equal(completed.material.uniforms.fkBrush.value.image.input,liveInput);
+  const renders=f.requests.filter(r=>r.command==='render');assert.equal(renders.length,2);assert.deepEqual(renders[0],renders[1]);
+  assert.ok(renders.every(r=>r.points.length===3));assert.deepEqual(f.errors,[]);
+ }
+});
+
+test('while a new native prefix is delayed the previous native result remains unchanged and visible',async()=>{
  const f=fixture();f.manager.makeCurve('live',f.attributes);await settled();const {mesh,geometry}=f.manager.getGeomFromInfo(f.manager.curveIdToGeomInfo.get('live'));geometry.setDrawRange(0,60);
- f.fk.setBindings({RECT:'rect'});f.fk.hover(mesh,f.attributes);await settled();f.fk.hoverEnd(mesh);mesh.visible=true;
- const post=f.context.webkit.messageHandlers.FeatherKrita.postMessage;let release;const delayed=new Promise(r=>release=r);
- f.context.webkit.messageHandlers.FeatherKrita.postMessage=async body=>{if(body.command==='render'&&body.points.length>1)await delayed;return post(body);};
- const timers=f.context.setTimeout;f.context.setTimeout=()=>0;
- f.fk.preview(mesh,f.attributes);
- const immediate=f.manager.sceneGroup.children.find(m=>m.userData.fkLiveTip);assert.ok(immediate?.visible);
- assert.ok(immediate.geometry.attributes.fkUV.count>0);assert.equal(immediate.material.uniforms.fkBrush.value.image.tip,'rect');
- f.fk.preview(mesh,{...f.attributes,points:f.attributes.points.map(p=>({...p,x:p.x+.3}))});
- assert.equal(f.manager.sceneGroup.children.filter(m=>m.userData.fkLiveTip).length,1);
- assert.ok(immediate.geometry.attributes.position.array.some(v=>v>2));
- f.context.setTimeout=timers;geometry.setDrawRange(0,0);f.fk.preview(mesh,{});release();await new Promise(r=>setTimeout(r,30));
- assert.equal(f.manager.sceneGroup.children.filter(m=>m.userData.fkLiveTip||m.geometry.attributes.fkUV).length,0);
- assert.deepEqual(f.errors,[]);
+ f.fk.setBindings({RECT:'rect'});f.fk.preview(mesh,f.attributes);
+ for(let i=0;i<200&&!f.manager.sceneGroup.children.some(m=>m.geometry.attributes.fkUV);i++)await new Promise(r=>setTimeout(r,5));
+ const first=f.manager.sceneGroup.children.find(m=>m.geometry.attributes.fkUV),before=Array.from(first.geometry.attributes.position.array),texture=first.material.uniforms.fkBrush.value;
+ let release;const delayed=new Promise(r=>release=r),post=f.context.webkit.messageHandlers.FeatherKrita.postMessage;
+ f.context.webkit.messageHandlers.FeatherKrita.postMessage=async body=>{if(body.command==='render')await delayed;return post(body);};
+ for(let i=0;i<10;i++)f.fk.preview(mesh,{...f.attributes,points:f.attributes.points.map(p=>({...p,y:p.y+i*.1}))});
+ await tick();assert.ok(first.visible&&first.parent);assert.equal(first.material.uniforms.fkBrush.value,texture);assert.deepEqual(Array.from(first.geometry.attributes.position.array),before);
+ release();for(let i=0;i<200&&first.parent;i++)await new Promise(r=>setTimeout(r,5));
+ assert.equal(first.parent,null);assert.ok(f.manager.sceneGroup.children.some(m=>m.geometry.attributes.fkUV));
+ geometry.setDrawRange(0,0);f.fk.preview(mesh,{});await new Promise(r=>setTimeout(r,30));
+ assert.ok(!f.manager.sceneGroup.children.some(m=>m.geometry.attributes.fkUV));assert.deepEqual(f.errors,[]);
 });
 
 test('transparent paint does not write depth and preserves its layer order after redraw',async()=>{
@@ -269,4 +282,17 @@ test('reopening different-colored strokes preserves saved drawing order even whe
  assert.deepEqual(layers.map(m=>m.renderOrder),expected);
  assert.deepEqual(Array.from(layers[0].material.uniforms.fkBaseColor.value),[1,0,0,.5]);
  assert.deepEqual(Array.from(layers[1].material.uniforms.fkBaseColor.value),[0,0,1,.5]);
+});
+
+test('densified live normals use the same native raster frame as raw normals in the committed stroke',async()=>{
+ const f=fixture(),raw=[{x:0,y:0,z:1},{x:0,y:.6,z:.8},{x:0,y:0,z:1}];
+ const points=Array.from({length:7},(_,i)=>({x:i/3,y:Math.sin(i*.4)*.1,z:0}));
+ const final={...f.attributes,points,normals:raw,pressures:[]};
+ f.manager.makeCurve('live',final);await settled();const {mesh,geometry}=f.manager.getGeomFromInfo(f.manager.curveIdToGeomInfo.get('live'));geometry.setDrawRange(0,geometry.index.count);
+ f.fk.setBindings({RECT:'rect'});
+ const dense=points.map((_,i)=>f.fk.normalAt(raw,i,points.length));f.fk.preview(mesh,{...final,normals:dense,renderNormals:raw});
+ for(let i=0;i<200&&!f.manager.sceneGroup.children.some(m=>m.geometry.attributes.fkUV);i++)await new Promise(r=>setTimeout(r,5));
+ assert.ok(f.manager.sceneGroup.children.some(m=>m.geometry.attributes.fkUV));
+ geometry.setDrawRange(0,0);f.fk.preview(mesh,{});f.draw('finished',final);await settled();
+ const requests=f.requests.filter(r=>r.command==='render');assert.equal(requests.length,2);assert.deepEqual(requests[0],requests[1]);assert.deepEqual(f.errors,[]);
 });
