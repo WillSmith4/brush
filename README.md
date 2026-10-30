@@ -60,6 +60,12 @@ quads that can cut through the support. The contacted patch is saved with the
 stroke, so reopening it without the Guide preserves its surface. The provisional
 tip preview uses that same support while drawing. Existing PNG paint is retained.
 
+The live Guide canvas reserves GPU texture capacity instead of resizing an
+already-uploaded texture. Growing beyond capacity creates a new texture and
+releases the old one; shrinking reuses the allocation. UVs map the active frame
+into the reserved canvas, preserving world-space brush scale and avoiding stale,
+stretched images during successive Pencil updates.
+
 The native asynchronous render entry point prepares resources on Qt's owner
 thread, then waits for Krita and encodes output on a background queue. Completion
 and image cleanup return to the owner thread. Stroke files use a separate serial

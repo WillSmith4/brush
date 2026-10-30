@@ -711,6 +711,7 @@
     if(holder.fastEntry!==entry||!holder.fastGuideCanvas){
       clearFastPreview(holder);
       const canvas=document.createElement("canvas"),mask=document.createElement("canvas");mask.width=mask.height=1;
+      canvas.width=2**Math.ceil(Math.log2(frame.width));canvas.height=2**Math.ceil(Math.log2(frame.height));
       const context=mask.getContext("2d");context.fillStyle="white";context.fillRect(0,0,1,1);
       const texture=new api.Texture(canvas),coverage=new api.Texture(mask);
       for(const t of [texture,coverage]){t.generateMipmaps=false;t.minFilter=api.LinearFilter;t.magFilter=api.LinearFilter;t.needsUpdate=true;}
@@ -719,8 +720,21 @@
       holder.fast.renderOrder=Number.MAX_SAFE_INTEGER-2;holder.fast.frustumCulled=false;holder.fast.matrixAutoUpdate=false;
       holder.fastEntry=entry;entry.refs++;holder.fastGuideCanvas=canvas;holder.fastTextures=[texture,coverage];mesh.parent.add(holder.fast);
     }
-    const canvas=holder.fastGuideCanvas;canvas.width=frame.width;canvas.height=frame.height;
+    let canvas=holder.fastGuideCanvas;
+    if(frame.width>canvas.width||frame.height>canvas.height){
+      // WebGL2 texture storage is immutable after its first upload. Updating a
+      // larger canvas through needsUpdate leaves the old GPU image in place.
+      // Grow capacity geometrically and replace the GPU texture atomically.
+      const grown=document.createElement("canvas");
+      grown.width=Math.max(canvas.width,2**Math.ceil(Math.log2(frame.width)));
+      grown.height=Math.max(canvas.height,2**Math.ceil(Math.log2(frame.height)));
+      const texture=new api.Texture(grown);texture.generateMipmaps=false;texture.minFilter=api.LinearFilter;texture.magFilter=api.LinearFilter;
+      const previous=holder.fastTextures[0];holder.fastTextures[0]=texture;
+      holder.fast.material.uniforms.fkBrush.value=texture;
+      holder.fastGuideCanvas=grown;canvas=grown;previous.dispose();
+    }
     const context=canvas.getContext("2d"),points=frame.points,distances=[0];
+    context.clearRect(0,0,canvas.width,canvas.height);
     for(let i=1;i<points.length;i++)distances.push(distances[i-1]+Math.hypot(...sub(points[i],points[i-1])));
     const length=distances.at(-1),count=Math.min(2048,Math.max(2,Math.ceil(length/Math.max(size*.15,1e-8))+1));let segment=0;
     for(let i=0;i<count;i++){
@@ -732,7 +746,12 @@
     }
     holder.fastTextures[0].needsUpdate=true;
     const record={frame,attributes},info={numOfPoints:points.length,geomAttributes:0};
-    const geometry=guidePaintGeometry(mesh.geometry,info,record,attributes,patch);holder.fast.geometry.dispose();holder.fast.geometry=geometry;
+    const geometry=guidePaintGeometry(mesh.geometry,info,record,attributes,patch);
+    // Paint occupies the top-left frame rectangle within the reserved canvas.
+    // Keep world-to-pixel scale exact even when the stroke shrinks or bends.
+    const uv=geometry.attributes.fkUV.array,sx=frame.width/canvas.width,sy=frame.height/canvas.height;
+    for(let i=0;i<uv.length;i+=2){uv[i]*=sx;uv[i+1]=1-(1-uv[i+1])*sy;}
+    holder.fast.geometry.dispose();holder.fast.geometry=geometry;
     holder.fast.matrix.copy(mesh.matrix);holder.fast.matrixWorldNeedsUpdate=true;holder.fast.visible=true;
     holder.fast.onBeforeRender=()=>syncUniforms(mesh.material,holder.fast.material);
     for(const r of states.get(holder.manager).records.values())r.mesh.visible=false;
