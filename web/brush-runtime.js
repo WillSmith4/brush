@@ -8,6 +8,16 @@
   const artworks = new Map(), metadata = new Map(), assets = new Map(), previews = new WeakMap();
   const restoringSurfaces = new Set();
   const hoverStates=new Map();
+  const tipCache=new Map();
+  const paintOrders=new Map();let lastPaintOrder=0,legacyPaintOrder=0;
+  function paintOrder(id,saved){
+    // Loaded records may arrive out of document order. A persisted layer order
+    // is authoritative, while legacy strokes keep their document traversal.
+    if(Number.isFinite(saved))paintOrders.set(id,saved);
+    else if(!paintOrders.has(id))paintOrders.set(id,++legacyPaintOrder);
+    lastPaintOrder=Math.max(lastPaintOrder,paintOrders.get(id));return paintOrders.get(id);
+  }
+  function newPaintOrder(id){return paintOrder(id,Math.max(Date.now()*1000,lastPaintOrder+1));}
   let renderTail = Promise.resolve(), textureBytes = 0;
   const MAX_TEXTURE_BYTES = 64 * 1024 * 1024;
   const post = body => root.webkit.messageHandlers.FeatherKrita.postMessage(body);
@@ -145,15 +155,16 @@
     if(artworks.has(id))return;
     const preset=(gesture?.bindings || bindings)[attributes.shape];
     if(!preset){artworks.set(id,Promise.resolve(null));return;}
-    const record={version:2,preset,attributes:clone(attributes)};
+    const record={version:2,preset,paintOrder:newPaintOrder(id),attributes:clone(attributes)};
     artworks.set(id,Promise.resolve(record));save(id,record).catch(fail);
   }
   function artwork(id) {
+    paintOrder(id);
     if(!artworks.has(id))artworks.set(id,checked({command:"loadStroke",id}).then(r=>r.record));
     return artworks.get(id);
   }
   function inherit(id,source) {
-    const pending=artwork(source).then(async original=>{if(!original)return null;const record=clone(original);await save(id,record);return record;});
+    const pending=artwork(source).then(async original=>{if(!original)return null;const record=clone(original);record.paintOrder=newPaintOrder(id);await save(id,record);return record;});
     artworks.set(id,pending);pending.catch(fail);
   }
   function presetInfo(preset) {
@@ -192,7 +203,7 @@
       // incompatible depth values in the same texture (and reconstruct spikes).
       for(const material of Array.isArray(object.material)?object.material:[object.material]){
         if(!material?.fragmentShader?.includes("gl_FragDepth"))continue;
-        for(const [name,value] of [["near",near],["far",far]]){
+        for(const [name,value] of [["near",near],["far",far],["fkDepthBias",0]]){
           const uniform=material.uniforms?.[name];if(!uniform)continue;
           if(!captureUniforms.has(uniform))captureUniforms.set(uniform,uniform.value);
           uniform.value=value;
@@ -219,6 +230,11 @@
         }
       }
       ctx.putImageData(image,0,0);const png=canvas.toDataURL("image/png").split(",")[1];
+      // Color compositing must not write transparent-stroke depth. Populate
+      // depth separately for smudge reconstruction, without touching that color.
+      const depthMaterials=new Map(),autoClear=renderer.autoClear;
+      scene.traverse(object=>{for(const material of Array.isArray(object.material)?object.material:[object.material])if(material?.userData?.fkPaint&&!depthMaterials.has(material)){depthMaterials.set(material,{depthWrite:material.depthWrite,colorWrite:material.colorWrite});material.depthWrite=true;material.colorWrite=false;}});
+      try{renderer.autoClear=false;renderer.render(scene,camera);}finally{renderer.autoClear=autoClear;for(const [material,saved]of depthMaterials){material.depthWrite=saved.depthWrite;material.colorWrite=saved.colorWrite;}}
       // Preserve the sampled surface depth, so smudge paint lies on the artwork
       // it sampled rather than disappearing inside a round Feather stroke.
       const depthTarget=new api.RenderTarget(frame.width,frame.height,{depthBuffer:false});
@@ -255,7 +271,7 @@
       if(meta.engine==="mypaintbrush")meta.samplesBackdrop=true;
       if(!active())return null;
       const request=strokeRequest(record.attributes,record.preset,api.fallbackSize,meta,cameraRight());
-      if(meta.samplesBackdrop){
+      if(meta.samplesBackdrop&&!record.tip){
         // Batch-buffer compaction temporarily removes replacement meshes. Wait
         // for saved paint to return before sampling another brush's substrate.
         await Promise.resolve();await Promise.all([...restoringSurfaces]);
@@ -327,7 +343,7 @@
     unhideState(state);state.generation++;state.pending.clear();
     for(const id of [...state.records.keys()])removeReplacement(state,id);
   }
-  function materialFor(original,entry,baseColor) {
+  function materialFor(original,entry,baseColor,size=api.fallbackSize) {
     const material=new api.ShaderMaterial();material.copy(original);
     for(const flag of ["isCurveMaterial","isCutoutMaterial","isSelectionMaterial"])if(flag in original)material[flag]=original[flag];
     material.vertexShader="attribute vec2 fkUV;\nvarying vec2 fkTexCoord;\n"+original.vertexShader.replace(/void\s+main\s*\(\s*\)\s*\{/,"$&\n fkTexCoord = fkUV;");
@@ -339,9 +355,19 @@
       "fkSample.rgb = clamp(fkSample.rgb + vColor.rgb - fkBaseColor.rgb, 0.0, 1.0);\n"+
       "fkSample.a *= fkBaseColor.a > 0.0001 ? vColor.a / fkBaseColor.a : 0.0;\n"+
       "vec4 diffuseColor = fkSample;");
+    // Feather writes gl_FragDepth explicitly, so fixed-function polygonOffset
+    // cannot reliably separate paint from its drawing surface. Apply a small
+    // world-space bias in the same linear depth convention as the host.
+    if(material.fragmentShader.includes("gl_FragDepth = vDepth;")){
+      material.fragmentShader="uniform float fkDepthBias;\nuniform float near;\nuniform float far;\n"+material.fragmentShader.replace("gl_FragDepth = vDepth;","gl_FragDepth = max(0.0, vDepth - fkDepthBias / max(far - near, 0.000001));");
+      material.uniforms.fkDepthBias={value:Math.max(Number(size)||api.fallbackSize,0.00001)*0.005};
+    }
     material.uniforms.fkBrush={value:entry.texture};material.uniforms.fkCoverage={value:entry.mask};
     material.uniforms.fkBaseColor={value:[baseColor[0]/255,baseColor[1]/255,baseColor[2]/255,baseColor[3]??1]};
-    material.side=2;material.transparent=true;material.depthWrite=true;material.polygonOffset=true;material.polygonOffsetFactor=-1;material.polygonOffsetUnits=-1;
+    material.defaultAttributeValues.fkHide=[0];
+    material.side=2;material.forceSinglePass=true;material.transparent=true;material.blending=1;
+    material.depthWrite=false;material.depthTest=true;material.userData.fkPaint=true;
+    material.polygonOffset=true;material.polygonOffsetFactor=-1;material.polygonOffsetUnits=-1;
     material.needsUpdate=true;return material;
   }
   function syncUniforms(original,material) {
@@ -369,7 +395,7 @@
     const vertices=[],prepared={points:(attributes.points||[]).map(xyz),normals:(attributes.normals||[]).map(xyz)},originalPrepared={points:(record.attributes.points||[]).map(xyz),normals:(record.attributes.normals||[]).map(xyz)};
     let work=0;
     for(const {r:[x0,y0,x1,y1]} of rectangles)for(const [x,y] of [[x0,y0],[x1,y0],[x1,y1],[x0,y1]]){
-      if(++work%1024===0)await new Promise(resolve=>setTimeout(resolve,0));
+      if(++work%1024===0&&!record.preview)await new Promise(resolve=>setTimeout(resolve,0));
       const vertex={x,y,...mapPixel(frame,x,y,attributes,prepared)};
       if(entry.depth){
         const original=mapPixel(frame,x,y,record.attributes,originalPrepared).position,baseHeight=dot(sub(original,frame.origin),frame.normal);
@@ -423,7 +449,7 @@
     try{geometry=await surfaceGeometry(geom.geometry,info,record,entry,attributes);}catch(error){entry.refs--;throw error;}
     if(!active()){geometry.dispose();entry.refs--;evict();return;}
     removeReplacement(state,id);
-    const material=materialFor(geom.mesh.material,entry,record.attributes.color || [0,0,0,1]);
+    const material=materialFor(geom.mesh.material,entry,record.attributes.color || [0,0,0,1],attributes.size);
     if(record.result.composited){
       material.blending=5;material.blendSrc=201;material.blendDst=200;material.blendSrcAlpha=201;material.blendDstAlpha=200;
       // The backdrop already contains host shading/patterns. Do not shade it a
@@ -431,7 +457,7 @@
       if(material.fragmentShader.includes("out vec4 gColor"))material.fragmentShader=material.fragmentShader.replace(/}\s*$/,"gColor = fkSample; gBloom = vec4(0.0, 0.0, 0.0, fkSample.a);\n}");
     }
     const mesh=new api.Mesh(geometry,material);mesh.castShadow=geom.mesh.castShadow;mesh.receiveShadow=geom.mesh.receiveShadow;
-    mesh.renderOrder=geom.mesh.renderOrder;mesh.matrixAutoUpdate=false;mesh.matrix.copy(geom.mesh.matrix);
+    mesh.renderOrder=record.preview?Number.MAX_SAFE_INTEGER-1:paintOrder(id,record.paintOrder);mesh.matrixAutoUpdate=false;mesh.matrix.copy(geom.mesh.matrix);
     mesh.onBeforeRender=()=>syncUniforms(geom.mesh.material,material);
     const indexCount=info.fkIndexCount??((info.numOfPoints-1)*24+12);
     const syncVisibility=()=>{
@@ -496,6 +522,7 @@
   function setBindings(next){
     bindings=Object.fromEntries(Object.entries(next).filter(([shape,id])=>SHAPES.includes(shape)&&typeof id==="string"));
     for(const [mesh,state] of hoverStates)hover(mesh,state.attributes,state.distance);
+    const brush=api?.currentBrush?.();if(brush&&bindings[brush.shape])warmTip(brush).catch(fail);
   }
   function hoverPositions(polygons,size,u=[1,0,0],v=[0,0,-1]){
     const positions=[];
@@ -544,6 +571,7 @@
       mesh.addEventListener("removed",state.removed);}
     state.attributes=attributes;state.distance=distance;
     const preset=bindings[attributes.shape];
+    if(preset)warmTip(attributes).catch(fail);
     if(!preset){releaseHover(state);api.redraw?.();return;}
     if(state.preset===preset){updateHover(mesh,state);return;}
     releaseHover(state);state.preset=preset;const generation=state.generation;
@@ -574,12 +602,63 @@
       return clamp(pressures[j]*(1-(f-j))+(pressures[Math.min(j+1,pressures.length-1)]||0)*(f-j),0,1);
     });
   }
+  function tipColor(attributes){const color=attributes.color||[0,0,0];return [...color.slice(0,3),attributes.opacity??color[3]??1];}
+  function tipKey(attributes,preset){return JSON.stringify([preset,tipColor(attributes)]);}
+  function warmTip(attributes){
+    const preset=(gesture?.bindings||bindings)[attributes.shape];if(!preset)return Promise.resolve(null);
+    const key=tipKey(attributes,preset);if(tipCache.has(key))return tipCache.get(key).promise;
+    const item={entry:null,record:null};tipCache.set(key,item);
+    item.promise=(async()=>{
+      const a={shape:attributes.shape,size:1,color:tipColor(attributes),points:[{x:0,y:0,z:0}],normals:[{x:0,y:0,z:1}],pressures:[1]};
+      const record={version:2,preset,preview:true,tip:true,attributes:a};
+      await renderRecord(null,record);const entry=await loadAssets(record);entry.refs++;
+      item.entry=entry;item.record=record;
+      // Small, bounded cache. A brush texture is computed before contact from
+      // the actual preset; it is not the substituted Feather tube.
+      while(tipCache.size>8){const oldest=tipCache.keys().next().value;if(oldest===key)break;const old=tipCache.get(oldest);if(!old.entry)break;old.entry.refs--;tipCache.delete(oldest);}
+      evict();return item;
+    })().catch(error=>{tipCache.delete(key);throw error;});
+    return item.promise;
+  }
+  function clearFastPreview(holder){
+    if(holder.fast){holder.fast.removeFromParent();holder.fast.geometry.dispose();holder.fast.material.dispose();holder.fast=null;holder.fastEntry.refs--;holder.fastEntry=null;}
+  }
+  function fastPreview(mesh,holder,attributes,preset){
+    const item=tipCache.get(tipKey(attributes,preset));if(!item?.entry||!item.entry.rectangles.length)return false;
+    const entry=item.entry,frame=item.record.frame,points=attributes.points.map(xyz),normals=(attributes.normals||[]).map(xyz),size=attributes.size||api.fallbackSize;
+    const distances=[0];for(let i=1;i<points.length;i++)distances.push(distances[i-1]+Math.hypot(...sub(points[i],points[i-1])));
+    const length=distances.at(-1),step=Math.max(size*.15,length/2047,1e-8),count=Math.min(2048,Math.max(2,Math.ceil(length/step)+1));
+    const positions=new Float32Array(count*12),up=new Float32Array(count*12),uv=new Float32Array(count*8),colors=new Uint8Array(count*16),indices=new Uint32Array(count*6),right=cameraRight(),color=tipColor(attributes);
+    let segment=0;
+    for(let i=0;i<count;i++){
+      const d=length*i/(count-1);while(segment<points.length-2&&distances[segment+1]<d)segment++;
+      const f=clamp((d-distances[segment])/(distances[segment+1]-distances[segment]||1),0,1),center=lerp(points[segment],points[segment+1]||points[segment],f);
+      const n=unit(lerp(normals[segment]||frame.normal,normals[segment+1]||normals[segment]||frame.normal,f));
+      const u=unit(sub(right,mul(n,dot(right,n))),frame.u),v=unit(cross(n,u),frame.v);
+      const pressure=attributes.pressures?.length?clamp((attributes.pressures[segment]??1)*(1-f)+(attributes.pressures[segment+1]??1)*f,0,1):1;
+      const corners=[[frame.minX,frame.maxY,0,1],[frame.maxX,frame.maxY,1,1],[frame.maxX,frame.minY,1,0],[frame.minX,frame.minY,0,0]];
+      corners.forEach(([x,y,tx,ty],j)=>{positions.set(add(center,add(mul(u,x*size*pressure),mul(v,y*size*pressure))),i*12+j*3);up.set(n,i*12+j*3);uv.set([tx,ty],i*8+j*2);colors.set([...color.slice(0,3),Math.round(color[3]*255)],i*16+j*4);});
+      indices.set([i*4,i*4+2,i*4+1,i*4,i*4+3,i*4+2],i*6);
+    }
+    if(holder.fastEntry!==entry){clearFastPreview(holder);const material=materialFor(mesh.material,entry,color,size);const geometry=new api.Geometry();holder.fast=new api.Mesh(geometry,material);holder.fast.name="Krita immediate tip preview";holder.fast.userData.fkLiveTip=true;holder.fast.renderOrder=Number.MAX_SAFE_INTEGER-2;holder.fast.frustumCulled=false;holder.fast.matrixAutoUpdate=false;holder.fastEntry=entry;entry.refs++;mesh.parent.add(holder.fast);}
+    if(holder.fast.material.uniforms.fkDepthBias)holder.fast.material.uniforms.fkDepthBias.value=size*0.005;
+    const geometry=holder.fast.geometry;
+    const set=(name,array,size)=>{const old=geometry.attributes[name];if(old&&old.array.length===array.length){old.array.set(array);old.needsUpdate=true;}else geometry.setAttribute(name,new api.Attribute(array,size));};
+    set("position",positions,3);set("fkUV",uv,2);set("color",colors,4);
+    set("normalUp",up,3);set("normalSide",up,3);set("upDown",new Float32Array(count*4),1);
+    if(mesh.geometry.attributes.properties){const p=new Float32Array(count*12);for(let i=0;i<count*4;i++)p.set(mesh.geometry.attributes.properties.array.subarray(0,3),i*3);set("properties",p,3);}
+    if(mesh.geometry.attributes.intensity)set("intensity",new Float32Array(count*4).fill(mesh.geometry.attributes.intensity.array[0]),1);
+    geometry.setIndex(new api.Attribute(indices,1));holder.fast.matrix.copy(mesh.matrix);holder.fast.matrixWorldNeedsUpdate=true;holder.fast.visible=true;
+    holder.fast.onBeforeRender=()=>syncUniforms(mesh.material,holder.fast.material);
+    for(const record of states.get(holder.manager).records.values())record.mesh.visible=false;
+    api.redraw?.();return true;
+  }
   function preview(mesh,attributes) {
     if(!attached||!mesh?.parent)return;
     let holder=previews.get(mesh);
     const stop=!mesh.geometry.drawRange.count||!attributes.shape;
     if(stop){
-      if(holder){holder.epoch++;clearTimeout(holder.timer);holder.timer=null;holder.latest=null;clearState(states.get(holder.manager));holder.manager.curveIdToGeomInfo.clear();}
+      if(holder){holder.epoch++;clearTimeout(holder.timer);holder.timer=null;holder.latest=null;clearFastPreview(holder);clearState(states.get(holder.manager));holder.manager.curveIdToGeomInfo.clear();}
       gesture=null;return;
     }
     if(!gesture)gesture={bindings:{...bindings}};
@@ -587,7 +666,7 @@
     if(!holder){
       const manager={sceneGroup:mesh.parent,curveIdToGeomInfo:new Map(),getGeomFromInfo:()=>({geometry:mesh.geometry,mesh})};
       holder={manager,timer:null,latest:null,epoch:0,running:false,disposed:false};previews.set(mesh,holder);register(manager);
-      mesh.addEventListener("removed",()=>{holder.disposed=true;holder.epoch++;clearTimeout(holder.timer);clearState(states.get(manager));managers.delete(manager);});
+      mesh.addEventListener("removed",()=>{holder.disposed=true;holder.epoch++;clearTimeout(holder.timer);clearFastPreview(holder);clearState(states.get(manager));managers.delete(manager);});
     }
     const count=attributes.points?.length || 0;
     if(count<2)return;
@@ -597,10 +676,15 @@
     const mask=maskSource(mesh.geometry,mesh.material);mask.array.fill(1);mask.needsUpdate=true;
     state.hidden.set("preview",{source:mesh.geometry,mask,offset:0,count:mask.count});
     holder.latest={attributes,preset,indexCount:mesh.geometry.drawRange.count};
+    holder.lastAttributes=attributes;holder.revision=(holder.revision||0)+1;
+    if(!fastPreview(mesh,holder,attributes,preset)){
+      const epoch=holder.epoch;
+      warmTip(attributes).then(()=>{if(holder.epoch===epoch&&!holder.disposed&&mesh.geometry.drawRange.count)fastPreview(mesh,holder,holder.lastAttributes,preset);}).catch(fail);
+    }
     const run=async()=>{
       holder.timer=null;if(holder.running||holder.disposed||!holder.latest)return;
       const latest=holder.latest;holder.latest=null;holder.running=true;
-      const epoch=holder.epoch,active=()=>!holder.disposed&&epoch===holder.epoch&&!!mesh.parent;
+      const epoch=holder.epoch,revision=holder.revision,active=()=>!holder.disposed&&epoch===holder.epoch&&!!mesh.parent;
       try{
         const a=clone(latest.attributes),record={version:2,preset:latest.preset,preview:true,attributes:a};
         const rendered=await renderRecord(null,record,active);
@@ -609,12 +693,18 @@
         const info={attributes:a,numOfPoints:a.points.length,geomAttributes:0,geomIndex:0,fkIndexCount:latest.indexCount};
         holder.manager.curveIdToGeomInfo.set("preview",info);
         await replaceCurve(holder.manager,state,"preview",info,record,entry,a,active);
+        if(active()){
+          // Keep the fast tip trail if it already includes newer Pencil input.
+          const exact=state.records.get("preview")?.mesh;
+          if(holder.fast&&holder.revision!==revision){if(exact)exact.visible=false;}
+          else if(holder.fast)holder.fast.visible=false;
+        }
       }catch(error){fail(error);}finally{
         holder.running=false;
-        if(holder.latest&&!holder.disposed)holder.timer=setTimeout(run,0);
+        if(holder.latest&&!holder.disposed)queueMicrotask(run);
       }
     };
-    if(!holder.running&&!holder.timer)holder.timer=setTimeout(run,0);
+    if(!holder.running)void run();
   }
   function savePreset(id,shape){post({command:"savePreset",id,shape}).catch(fail);}
   async function selectPreset(id,shape){try{const result=await checked({command:"selectPreset",id,shape});if(result.bindings)setBindings(result.bindings);}catch(error){fail(error);}}

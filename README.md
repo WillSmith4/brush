@@ -36,6 +36,22 @@ mesh. Live drawing retains the most recent completed Krita image while coalescin
 incoming Pencil updates; original Feather tubes are hidden immediately only for
 injected types. Preview points come directly from the drawing path.
 
+Transparent Krita paint uses source-over compositing without writing depth, in
+a stable per-stroke order. Opaque scene surfaces still occlude paint. Smudge
+captures color first and obtains substrate depth in a separate pass, so paint
+layers do not reject one another while accumulating opacity.
+The host shader writes linear fragment depth explicitly, so paint applies its
+small surface separation in that shader instead of relying on polygon offset.
+This prevents a single stroke from fighting its drawing support. The depth bias
+is disabled during smudge capture and restored afterward.
+
+Selecting or hovering an injected brush warms a small native-rendered tip cache.
+Pencil events can display a textured tip trail synchronously while the exact
+native stroke is still rendering. The fast tip trail is a provisional preview;
+the full preset dynamics come from the native stroke result. Preview startup
+does not depend on a timer firing while the Pencil is held down. Saved artwork
+continues to use the complete native result, with independent undo and editing.
+
 The native asynchronous render entry point prepares resources on Qt's owner
 thread, then waits for Krita and encodes output on a background queue. Completion
 and image cleanup return to the owner thread. Stroke files use a separate serial

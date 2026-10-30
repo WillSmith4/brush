@@ -126,7 +126,8 @@ test('Pencil hover uses the imported outline, scales with brush size, and Restor
  assert.equal(f.requests.filter(r=>r.command==='presetInfo').length,1);
  f.fk.setBindings({});assert.equal(mesh.children.length,0);assert.ok(geometry.attributes.fkHide.array.every(x=>x===0));
  assert.deepEqual(Array.from(geometry.attributes.position.array),original);
- assert.equal(f.requests.filter(r=>r.command==='saveStroke'||r.command==='render').length,0);
+ assert.equal(f.requests.filter(r=>r.command==='saveStroke').length,0);
+ assert.ok(f.requests.filter(r=>r.command==='render').every(r=>r.points.length===1));
 });
 
 test('switching injected presets changes the hover outline without changing the host tip',async()=>{
@@ -197,7 +198,8 @@ test('live Krita texture becomes visible before Pencil-up even with continuous i
  release();for(let i=0;i<200&&!f.manager.sceneGroup.children.some(m=>m.geometry.attributes.fkUV);i++)await new Promise(r=>setTimeout(r,5));
  assert.ok(f.manager.sceneGroup.children.some(m=>m.geometry.attributes.fkUV));assert.deepEqual(f.errors,[]);
  // Only the in-flight render and newest queued update are needed, not 16 jobs.
- assert.ok(f.requests.filter(r=>r.command==='render').length<=2);
+ assert.ok(f.requests.filter(r=>r.command==='render'&&r.points.length>1).length<=2);
+ assert.equal(f.requests.filter(r=>r.command==='render'&&r.points.length===1).length,1);
  geometry.setDrawRange(0,0);f.fk.preview(mesh,{});await new Promise(r=>setTimeout(r,20));
  assert.ok(!f.manager.sceneGroup.children.some(m=>m.geometry.attributes.fkUV));
  assert.ok(geometry.attributes.fkHide.array.every(v=>v===0));
@@ -225,4 +227,46 @@ test('geometry construction yields to input and saving a completed stroke does n
  f.fk.setBindings({RECT:'rect'});let heartbeats=0;const timer=setInterval(()=>heartbeats++,1);f.draw('big',long);
  for(let i=0;i<400&&!f.manager.sceneGroup.children.some(m=>m.geometry.attributes.fkUV);i++)await new Promise(r=>setTimeout(r,5));
  clearInterval(timer);releaseSave();assert.ok(heartbeats>1);assert.ok(f.manager.sceneGroup.children.some(m=>m.geometry.attributes.fkUV));assert.deepEqual(f.errors,[]);
+});
+
+test('a warmed native tip draws synchronously while timers and exact render replies are delayed',async()=>{
+ const f=fixture();f.manager.makeCurve('live',f.attributes);await settled();const {mesh,geometry}=f.manager.getGeomFromInfo(f.manager.curveIdToGeomInfo.get('live'));geometry.setDrawRange(0,60);
+ f.fk.setBindings({RECT:'rect'});f.fk.hover(mesh,f.attributes);await settled();f.fk.hoverEnd(mesh);mesh.visible=true;
+ const post=f.context.webkit.messageHandlers.FeatherKrita.postMessage;let release;const delayed=new Promise(r=>release=r);
+ f.context.webkit.messageHandlers.FeatherKrita.postMessage=async body=>{if(body.command==='render'&&body.points.length>1)await delayed;return post(body);};
+ const timers=f.context.setTimeout;f.context.setTimeout=()=>0;
+ f.fk.preview(mesh,f.attributes);
+ const immediate=f.manager.sceneGroup.children.find(m=>m.userData.fkLiveTip);assert.ok(immediate?.visible);
+ assert.ok(immediate.geometry.attributes.fkUV.count>0);assert.equal(immediate.material.uniforms.fkBrush.value.image.tip,'rect');
+ f.fk.preview(mesh,{...f.attributes,points:f.attributes.points.map(p=>({...p,x:p.x+.3}))});
+ assert.equal(f.manager.sceneGroup.children.filter(m=>m.userData.fkLiveTip).length,1);
+ assert.ok(immediate.geometry.attributes.position.array.some(v=>v>2));
+ f.context.setTimeout=timers;geometry.setDrawRange(0,0);f.fk.preview(mesh,{});release();await new Promise(r=>setTimeout(r,30));
+ assert.equal(f.manager.sceneGroup.children.filter(m=>m.userData.fkLiveTip||m.geometry.attributes.fkUV).length,0);
+ assert.deepEqual(f.errors,[]);
+});
+
+test('transparent paint does not write depth and preserves its layer order after redraw',async()=>{
+ const f=fixture();f.fk.setBindings({RECT:'rect'});f.draw('first');await settled();f.draw('second');await settled();
+ const meshes=f.manager.sceneGroup.children.filter(m=>m.geometry.attributes.fkUV);
+ assert.equal(meshes.length,2);assert.ok(meshes.every(m=>!m.material.depthWrite&&m.material.depthTest&&m.material.forceSinglePass));
+ assert.ok(meshes[0].renderOrder<meshes[1].renderOrder);
+ const orders=meshes.map(m=>m.renderOrder);f.manager.clear();await settled();
+ f.manager.makeCurve('second',f.attributes);f.manager.makeCurve('first',f.attributes);await settled();
+ const recreated=f.manager.sceneGroup.children.filter(m=>m.geometry.attributes.fkUV).map(m=>m.renderOrder).sort((a,b)=>a-b);
+ assert.deepEqual(recreated,orders);
+});
+
+test('reopening different-colored strokes preserves saved drawing order even when loading is reversed',async()=>{
+ const first=fixture();first.fk.setBindings({RECT:'rect'});
+ first.draw('red',{...first.attributes,color:[255,0,0,.5]});await settled();
+ first.draw('blue',{...first.attributes,color:[0,0,255,.5]});await settled();
+ const expected=[first.store.get('red').paintOrder,first.store.get('blue').paintOrder];assert.ok(expected[0]<expected[1]);
+ const opened=fixture(first.store);
+ opened.manager.makeCurve('blue',{...opened.attributes,color:[0,0,255,.5]});
+ opened.manager.makeCurve('red',{...opened.attributes,color:[255,0,0,.5]});await settled();
+ const layers=opened.manager.sceneGroup.children.filter(m=>m.geometry.attributes.fkUV).sort((a,b)=>a.renderOrder-b.renderOrder);
+ assert.deepEqual(layers.map(m=>m.renderOrder),expected);
+ assert.deepEqual(Array.from(layers[0].material.uniforms.fkBaseColor.value),[1,0,0,.5]);
+ assert.deepEqual(Array.from(layers[1].material.uniforms.fkBaseColor.value),[0,0,1,.5]);
 });
