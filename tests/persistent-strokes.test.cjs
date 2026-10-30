@@ -164,7 +164,65 @@ test('separate substrate depths never form long bridging triangles',async()=>{
  saved.surface={encoding:'linear-camera-v3',distance:8,near:.001,far:16,depth:Buffer.from(JSON.stringify({width,height,depthSplit:true})).toString('base64')};
  saved.result.composited=true;
  const f=fixture(first.store);f.manager.makeCurve('layers',f.attributes);await settled();assert.deepEqual(f.errors,[]);
+ for(let i=0;i<200&&!f.manager.sceneGroup.children.some(m=>m.geometry.attributes.fkUV);i++)await new Promise(r=>setTimeout(r,5));
  const surface=f.manager.sceneGroup.children.find(m=>m.geometry.attributes.fkUV);assert.ok(surface);
  const {index,attributes:{position}}=surface.geometry;assert.ok(index.count>0);
  for(let i=0;i<index.count;i+=3){const zs=[0,1,2].map(k=>position.getZ(index.getX(i+k)));assert.ok(Math.max(...zs)-Math.min(...zs)<.01);}
+});
+
+test('drawing ordinary Feather strokes does not rebuild any existing Krita surfaces',async()=>{
+ const f=fixture();f.fk.setBindings({RECT:'rect'});f.draw('krita');await settled();
+ const original=f.manager.sceneGroup.children.find(m=>m.geometry.attributes.fkUV);assert.ok(original);
+ let disposed=0;original.geometry.addEventListener('dispose',()=>disposed++);
+ f.fk.setBindings({});for(let i=0;i<40;i++)f.draw('ordinary-'+i);
+ await settled();assert.equal(disposed,0);assert.ok(f.manager.sceneGroup.children.includes(original));
+ assert.equal(f.requests.filter(r=>r.command==='render').length,1);assert.deepEqual(f.errors,[]);
+});
+
+test('editing one Krita stroke keeps all unrelated meshes and textures',async()=>{
+ const f=fixture();f.fk.setBindings({RECT:'rect'});f.draw('one');await settled();f.draw('two');await settled();
+ const meshes=f.manager.sceneGroup.children.filter(m=>m.geometry.attributes.fkUV),info=f.manager.curveIdToGeomInfo.get('one');
+ assert.equal(meshes.length,2);let disposed=0;meshes.forEach(m=>m.geometry.addEventListener('dispose',()=>disposed++));
+ f.manager.updateCurve(info,{...f.attributes,size:2});await settled();
+ assert.equal(disposed,1);assert.ok(f.manager.sceneGroup.children.includes(meshes[1]));
+});
+
+test('live Krita texture becomes visible before Pencil-up even with continuous input',async()=>{
+ let release;const pending=new Promise(r=>release=r),f=fixture(new Map(),pending);
+ f.manager.makeCurve('live',f.attributes);await settled();const {mesh,geometry}=f.manager.getGeomFromInfo(f.manager.curveIdToGeomInfo.get('live'));
+ geometry.setDrawRange(0,60);f.fk.setBindings({RECT:'rect'});
+ f.fk.preview(mesh,f.attributes);assert.ok(geometry.attributes.fkHide.array.every(v=>v===1));
+ await new Promise(r=>setTimeout(r,5));
+ for(let i=0;i<15;i++)f.fk.preview(mesh,{...f.attributes,points:f.attributes.points.map(p=>({...p,x:p.x+i*.001}))});
+ release();for(let i=0;i<200&&!f.manager.sceneGroup.children.some(m=>m.geometry.attributes.fkUV);i++)await new Promise(r=>setTimeout(r,5));
+ assert.ok(f.manager.sceneGroup.children.some(m=>m.geometry.attributes.fkUV));assert.deepEqual(f.errors,[]);
+ // Only the in-flight render and newest queued update are needed, not 16 jobs.
+ assert.ok(f.requests.filter(r=>r.command==='render').length<=2);
+ geometry.setDrawRange(0,0);f.fk.preview(mesh,{});await new Promise(r=>setTimeout(r,20));
+ assert.ok(!f.manager.sceneGroup.children.some(m=>m.geometry.attributes.fkUV));
+ assert.ok(geometry.attributes.fkHide.array.every(v=>v===0));
+ assert.equal(f.requests.filter(r=>r.command==='saveStroke').length,0);
+});
+
+test('ordinary live drawing does not invoke Krita or mask the Feather brush',async()=>{
+ const f=fixture();f.manager.makeCurve('live',f.attributes);const {mesh,geometry}=f.manager.getGeomFromInfo(f.manager.curveIdToGeomInfo.get('live'));geometry.setDrawRange(0,60);
+ f.fk.preview(mesh,f.attributes);await settled();assert.equal(geometry.attributes.fkHide,undefined);
+ assert.equal(f.requests.filter(r=>r.command==='render'||r.command==='presetInfo').length,0);
+});
+
+test('injected presets receive normalized Pencil pressure without Feather shape scaling',()=>{
+ const f=fixture();assert.equal(f.fk.pressureInput([.2,.8],3,'RECT'),undefined);
+ f.fk.setBindings({RECT:'rect',CUBE:'rect'});
+ assert.deepEqual(Array.from(f.fk.pressureInput([.2,.8],3,'RECT')),[.2,.5,.8]);
+ assert.deepEqual(Array.from(f.fk.pressureInput([.2,.8],3,'CUBE')),[.2,.5,.8]);
+ assert.deepEqual(Array.from(f.fk.pressureInput([.2,.8],3,'RECT',false)),[]);
+});
+
+test('geometry construction yields to input and saving a completed stroke does not gate its display',async()=>{
+ const f=fixture();let releaseSave;const blocked=new Promise(r=>releaseSave=r),post=f.context.webkit.messageHandlers.FeatherKrita.postMessage;
+ f.context.webkit.messageHandlers.FeatherKrita.postMessage=async body=>{const result=await post(body);if(body.command==='saveStroke'&&body.record.result)await blocked;return result;};
+ const long={...f.attributes,points:Array.from({length:100},(_,i)=>({x:i*.1,y:Math.sin(i*.04),z:0})),normals:Array.from({length:100},()=>({x:0,y:0,z:1}))};
+ f.fk.setBindings({RECT:'rect'});let heartbeats=0;const timer=setInterval(()=>heartbeats++,1);f.draw('big',long);
+ for(let i=0;i<400&&!f.manager.sceneGroup.children.some(m=>m.geometry.attributes.fkUV);i++)await new Promise(r=>setTimeout(r,5));
+ clearInterval(timer);releaseSave();assert.ok(heartbeats>1);assert.ok(f.manager.sceneGroup.children.some(m=>m.geometry.attributes.fkUV));assert.deepEqual(f.errors,[]);
 });

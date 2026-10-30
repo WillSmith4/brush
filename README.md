@@ -30,6 +30,19 @@ Switching presets updates the outline, Pencil-down hides it, and Restore returns
 to the host preview. The existing host hover capability and cursor preference
 still control when the preview appears.
 
+Unchanged stroke meshes survive new drawing operations. Geometry generation
+yields in batches, and alpha coverage keeps fine brush-tip detail on a bounded
+mesh. Live drawing retains the most recent completed Krita image while coalescing
+incoming Pencil updates; original Feather tubes are hidden immediately only for
+injected types. Preview points come directly from the drawing path.
+
+The native asynchronous render entry point prepares resources on Qt's owner
+thread, then waits for Krita and encodes output on a background queue. Completion
+and image cleanup return to the owner thread. Stroke files use a separate serial
+storage queue. Full-pressure paint size is normalized to the unchanged cursor
+outline; native pressure dynamics remain active. Injected presets receive raw
+normalized Pencil pressure instead of Feather's shape-dependent scaling.
+
 The native engine is built from LibrePaint revision
 `e9946cce637d66003ca1b22dd9141db78f177cef`, with its Krita paint operators,
 resource loaders, color management, and stroke scheduler. The build uses Xcode
@@ -47,7 +60,7 @@ Run the JavaScript contracts with `npm ci --ignore-scripts && npm test`.
 Device compilation and static binary inspection are separate gates. A successful
 dependency build alone does not verify the renderer or demonstrate operation on
 an iPad. The revised native engine compiled successfully in Actions run
-40958196905. Windows tests use a native-response fixture; the device library
+40975781948. Windows tests use a native-response fixture; the device library
 cannot execute there. Actual brush appearance and mixing need an iPad run.
 
 The host-specific binary and frontend packaging are performed locally. Original

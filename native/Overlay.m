@@ -10,6 +10,13 @@ static NSString *const FKPresetBindingsKey = @"FeatherKrita.presetBindings.v1";
 static char FKControllerKey;
 static char FKRouterKey;
 static char FKServedTaskKey;
+static void *FKLibrary;
+static dispatch_queue_t FKStorageQueue(void) {
+    static dispatch_queue_t queue;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ queue = dispatch_queue_create("FeatherKrita.stroke-storage", DISPATCH_QUEUE_SERIAL); });
+    return queue;
+}
 static NSArray<NSString *> *FKShapes(void) {
     return @[@"POINTY", @"RECT", @"CUBE", @"MARKER", @"WIDEBRUSH", @"RIBBON"];
 }
@@ -25,7 +32,7 @@ static NSString *FKDirectory(void) {
 static NSDictionary *FKCall(NSDictionary *request) {
     static char *(*call)(const char *);
     static void (*releaseResponse)(char *);
-    static void *library;
+    void *library = FKLibrary;
     if (!call) {
         NSString *path = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"Frameworks/FeatherKritaEngine.dylib"];
         library = dlopen(path.fileSystemRepresentation, RTLD_NOW | RTLD_LOCAL);
@@ -33,6 +40,7 @@ static NSDictionary *FKCall(NSDictionary *request) {
         void *requestFunction = dlsym(library, "FKRequest"), *freeFunction = dlsym(library, "FKFreeResponse");
         if (!requestFunction || !freeFunction) { dlclose(library); library = NULL; return @{@"ok": @NO, @"error": @"The brush engine API is incomplete."}; }
         call = requestFunction; releaseResponse = freeFunction;
+        FKLibrary = library;
     }
     NSError *error;
     NSData *data = [NSJSONSerialization dataWithJSONObject:request options:0 error:&error];
@@ -44,6 +52,23 @@ static NSDictionary *FKCall(NSDictionary *request) {
     releaseResponse(raw);
     id result = responseData ? [NSJSONSerialization JSONObjectWithData:responseData options:0 error:nil] : nil;
     return [result isKindOfClass:NSDictionary.class] ? result : @{@"ok": @NO, @"error": @"Invalid brush engine response."};
+}
+
+static void FKRenderCompleted(const char *json, void *context) {
+    void (^reply)(id, NSString *) = (__bridge_transfer id)context;
+    NSData *data = json ? [[NSString stringWithUTF8String:json] dataUsingEncoding:NSUTF8StringEncoding] : nil;
+    id result = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+    if (![result isKindOfClass:NSDictionary.class]) reply(nil, @"Invalid asynchronous brush response.");
+    else reply(result, nil);
+}
+static void FKCallRender(NSDictionary *request, void (^reply)(id, NSString *)) {
+    void (*render)(const char *, void (*)(const char *, void *), void *) = FKLibrary ? dlsym(FKLibrary, "FKRenderAsync") : NULL;
+    if (!render) { reply(nil, @"The asynchronous brush renderer is missing."); return; }
+    NSError *error = nil;
+    NSData *data = [NSJSONSerialization dataWithJSONObject:request options:0 error:&error];
+    if (!data) { reply(nil, error.localizedDescription); return; }
+    NSString *json = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    render(json.UTF8String, FKRenderCompleted, (__bridge_retained void *)[reply copy]);
 }
 
 @interface FKController : NSObject <WKScriptMessageHandlerWithReply, UIDocumentPickerDelegate>
@@ -269,23 +294,29 @@ static NSDictionary *FKCall(NSDictionary *request) {
         if (![identifier isKindOfClass:NSString.class] || !identifier.length || identifier.length > 128 || [identifier rangeOfCharacterFromSet:allowed.invertedSet].location != NSNotFound) { reply(nil, @"Invalid stroke identifier."); return; }
         NSString *folder = [FKDirectory() stringByAppendingPathComponent:@"Strokes-v2"];
         NSString *path = [folder stringByAppendingPathComponent:[identifier stringByAppendingString:@".json"]];
+        void (^backgroundReply)(id, NSString *) = ^(id result, NSString *error) {
+            dispatch_async(dispatch_get_main_queue(), ^{ reply(result, error); });
+        };
+        dispatch_async(FKStorageQueue(), ^{
         if ([command isEqualToString:@"loadStroke"]) {
             NSData *data = [NSData dataWithContentsOfFile:path];
             id record = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
-            reply(@{@"ok": @YES, @"record": record ?: NSNull.null}, nil);
+            backgroundReply(@{@"ok": @YES, @"record": record ?: NSNull.null}, nil);
         } else {
             NSDictionary *record = body[@"record"];
-            if (![record isKindOfClass:NSDictionary.class]) { reply(nil, @"Invalid stroke record."); return; }
+            if (![record isKindOfClass:NSDictionary.class]) { backgroundReply(nil, @"Invalid stroke record."); return; }
             NSError *error = nil;
             NSData *data = [NSJSONSerialization dataWithJSONObject:record options:0 error:&error];
-            if (!data || data.length > 33554432) { reply(nil, @"Stroke data is invalid or too large."); return; }
-            if (![NSFileManager.defaultManager createDirectoryAtPath:folder withIntermediateDirectories:YES attributes:nil error:&error] || ![data writeToFile:path options:NSDataWritingAtomic error:&error]) { reply(nil, error.localizedDescription ?: @"Cannot save this stroke."); return; }
-            reply(@{@"ok": @YES}, nil);
+            if (!data || data.length > 33554432) { backgroundReply(nil, @"Stroke data is invalid or too large."); return; }
+            if (![NSFileManager.defaultManager createDirectoryAtPath:folder withIntermediateDirectories:YES attributes:nil error:&error] || ![data writeToFile:path options:NSDataWritingAtomic error:&error]) { backgroundReply(nil, error.localizedDescription ?: @"Cannot save this stroke."); return; }
+            backgroundReply(@{@"ok": @YES}, nil);
         }
+        });
     } else if ([command isEqualToString:@"render"] || [command isEqualToString:@"presetInfo"]) {
         NSString *preset = body[@"preset"];
         // A finished stroke retains its preset after Restore and after restart.
         if (![self initializeEngine] || !self.presets[preset]) { reply(nil, @"The saved brush resource is unavailable."); return; }
+        if ([command isEqualToString:@"render"]) { FKCallRender(body, reply); return; }
         NSDictionary *response = FKCall(body);
         reply(response, nil);
     } else reply(nil, @"The brush engine is not ready.");
