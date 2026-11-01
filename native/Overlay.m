@@ -289,17 +289,18 @@ static void FKCallRender(NSDictionary *request, void (^reply)(id, NSString *)) {
     } else if ([command isEqualToString:@"error"]) {
         if ([body[@"message"] isKindOfClass:NSString.class]) self.statusLabel.text = body[@"message"];
         reply(@{@"ok": @YES}, nil);
-    } else if ([command isEqualToString:@"loadStroke"] || [command isEqualToString:@"saveStroke"]) {
+    } else if ([command isEqualToString:@"loadStroke"] || [command isEqualToString:@"saveStroke"] || [command isEqualToString:@"loadStrokeTile"] || [command isEqualToString:@"saveStrokeTile"]) {
         NSString *identifier = body[@"id"];
         NSCharacterSet *allowed = [NSCharacterSet characterSetWithCharactersInString:@"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" ];
         if (![identifier isKindOfClass:NSString.class] || !identifier.length || identifier.length > 128 || [identifier rangeOfCharacterFromSet:allowed.invertedSet].location != NSNotFound) { reply(nil, @"Invalid stroke identifier."); return; }
-        NSString *folder = [FKDirectory() stringByAppendingPathComponent:@"Strokes-v2"];
+        BOOL tile = [command isEqualToString:@"loadStrokeTile"] || [command isEqualToString:@"saveStrokeTile"];
+        NSString *folder = [FKDirectory() stringByAppendingPathComponent:tile ? @"StrokeTiles-v1" : @"Strokes-v2"];
         NSString *path = [folder stringByAppendingPathComponent:[identifier stringByAppendingString:@".json"]];
         void (^backgroundReply)(id, NSString *) = ^(id result, NSString *error) {
             dispatch_async(dispatch_get_main_queue(), ^{ reply(result, error); });
         };
         dispatch_async(FKStorageQueue(), ^{
-        if ([command isEqualToString:@"loadStroke"]) {
+        if ([command isEqualToString:@"loadStroke"] || [command isEqualToString:@"loadStrokeTile"]) {
             NSData *data = [NSData dataWithContentsOfFile:path];
             id record = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
             backgroundReply(@{@"ok": @YES, @"record": record ?: NSNull.null}, nil);

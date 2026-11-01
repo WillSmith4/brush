@@ -9,13 +9,15 @@ async function settled(){for(let i=0;i<12;i++)await tick();}
 function fixture(store=new Map(),deferRender,deferOutline,extraApi={}){
  const requests=[],errors=[],pixelPackets=new Map(),streams=new Map();let pixelSequence=0;
  class Image {set src(value){Object.assign(this,JSON.parse(Buffer.from(value.split(',')[1],'base64').toString()));}async decode(){}}
- const context={console,setTimeout,clearTimeout,queueMicrotask,Image,CustomEvent:class{},dispatchEvent(){},document:{readyState:'complete',createElement(){
+ const context={console,setTimeout,clearTimeout,queueMicrotask,btoa:s=>Buffer.from(s,'binary').toString('base64'),atob:s=>Buffer.from(s,'base64').toString('binary'),Image,CustomEvent:class{},dispatchEvent(){},document:{readyState:'complete',createElement(){
   let image;return {getContext(){return {clearRect(){},drawImage(i){image=i;},getImageData(){const data=new Uint8ClampedArray(image.width*image.height*4);if(image.depthSplit){for(let y=0;y<image.height;y++)for(let x=0;x<image.width;x++){const height=x<image.width/2?0:1.5,z=(8-height-.001)/(16-.001),value=Math.round(z*16777215),at=(y*image.width+x)*4;data.set([value>>16,(value>>8)&255,value&255,255],at);}return {data};}for(let y=0;y<image.height;y++)for(let x=0;x<image.width;x++)if(image.tip==='rect'||(x/image.width-.5)**2+(y/image.height-.5)**2<.22)data[(y*image.width+x)*4+3]=255;return {data};}}}};
  }},webkit:{messageHandlers:{FeatherKrita:{async postMessage(body){
    requests.push(clone(body));
    if(body.command==='error')errors.push(body.message);
    if(body.command==='saveStroke'){store.set(body.id,clone(body.record));return {ok:true};}
    if(body.command==='loadStroke')return {ok:true,record:store.has(body.id)?clone(store.get(body.id)):null};
+   if(body.command==='saveStrokeTile'){store.set('tile/'+body.id,clone(body.record));return {ok:true};}
+   if(body.command==='loadStrokeTile')return {ok:true,record:clone(store.get('tile/'+body.id)||null)};
    if(body.command==='presetInfo'){
     if(deferOutline)await deferOutline;
     return {ok:true,extent:1,samplesBackdrop:false,strokeStreaming:extraApi.nativeStreaming?1:undefined,previewPixels:!!extraApi.nativePixels,previewSessions:!!extraApi.nativeSessions,outline:body.preset==='rect'?[[[-.5,-.25],[.5,-.25],[.5,.25],[-.5,.25]]]:[[[0,-.5],[.5,0],[0,.5],[-.5,0]]]};
@@ -420,7 +422,7 @@ test('one live native stroke appends each sample once and bakes that same stroke
  const all=f.requests.filter(r=>r.streamFrom!==undefined);assert.equal(all.reduce((n,r)=>n+r.points.length,0),240);assert.equal(all.filter(r=>r.streamFinish).length,1);
  assert.ok(!f.requests.some(r=>r.command==='render'&&r.streamFrom===undefined&&!r.previewEnd));
  assert.equal(f.store.get('saved-stream').result.pixels,undefined);assert.equal(f.pixelPackets.size,0);
- const reopened=fixture(f.store);reopened.manager.makeCurve('saved-stream',a);await settled();assert.deepEqual(reopened.errors,[]);assert.ok(reopened.manager.sceneGroup.children.some(m=>m.geometry.attributes.fkUV));assert.ok(!reopened.requests.some(r=>r.command==='render'));
+ const reopened=fixture(f.store);reopened.manager.makeCurve('saved-stream',a);await settled();assert.deepEqual(reopened.errors,[]);let loaded=false;reopened.manager.sceneGroup.traverse(m=>{loaded||=!!m.geometry?.attributes.fkUV;});assert.ok(loaded);assert.ok(!reopened.requests.some(r=>r.command==='render'));
 });
 
 test('an uncommitted streaming stroke closes its native painter on cancellation',async()=>{
@@ -437,4 +439,35 @@ test('a growing 6000-sample gesture never resubmits earlier native samples or ex
  assert.equal(samples.length,5997);assert.equal(calls.filter(r=>r.streamBegin).length,1);assert.ok(calls.every(r=>r.points.length<=64));
  assert.deepEqual(samples.map(p=>p[3]),samples.map((_,i)=>i*8));assert.deepEqual(samples.map(p=>p[2]),a.pressures.slice(0,5997));assert.deepEqual(f.errors,[]);
  mesh.geometry.setDrawRange(0,0);f.fk.preview(mesh,{});await settled();assert.equal(f.streams.size,0);
+});
+
+test('Pencil-up keeps live paint visible until its exact raster and frozen surface are saved',async()=>{
+ const f=fixture(new Map(),null,null,{nativeStreaming:true});f.manager.makeCurve('live',f.attributes);await settled();
+ const {mesh}=f.manager.getGeomFromInfo(f.manager.curveIdToGeomInfo.get('live'));mesh.geometry.setDrawRange(0,6);f.fk.setBindings({RECT:'rect'});await f.fk.preview(mesh,{...f.attributes,sourceTemplate:true});
+ let release,writing=false;const gate=new Promise(r=>release=r),post=f.context.webkit.messageHandlers.FeatherKrita.postMessage;
+ f.context.webkit.messageHandlers.FeatherKrita.postMessage=async body=>{if(body.command==='saveStrokeTile'){writing=true;await gate;}return post(body);};
+ f.fk.birth('frozen',f.attributes);mesh.geometry.setDrawRange(0,0);f.fk.preview(mesh,{});f.manager.makeCurve('frozen',f.attributes);
+ for(let i=0;i<200&&!writing;i++)await new Promise(r=>setTimeout(r,5));assert.ok(writing);
+ assert.ok(f.manager.sceneGroup.children.some(m=>m.geometry.attributes.fkUV&&m.visible));
+ release();for(let i=0;i<300&&!f.manager.sceneGroup.children.some(m=>m.children.some(c=>c.geometry?.attributes.fkUV));i++)await new Promise(r=>setTimeout(r,5));await settled();
+ const saved=f.store.get('frozen');assert.ok(saved.result.tiles.length);const tile=f.store.get('tile/'+saved.result.tiles[0].id);
+ assert.equal(Buffer.from(tile.result.rawPixels,'base64').length,258*258*5);assert.ok(tile.guideSurface.positions.length>0);assert.equal(tile.guideSurface.uv.length*3,tile.guideSurface.positions.length*2);
+ let finished;f.manager.sceneGroup.traverse(m=>{if(m.geometry?.attributes.fkUV)finished=m;});assert.ok(finished);const positions=Array.from(finished.geometry.attributes.position.array),texture=Array.from(finished.material.uniforms.fkBrush.value.image.data);
+ f.fk.setBindings({});const reopened=fixture(f.store);reopened.manager.makeCurve('frozen',f.attributes);for(let i=0;i<200&&!reopened.manager.sceneGroup.children.some(m=>m.children.some(c=>c.geometry?.attributes.fkUV));i++)await new Promise(r=>setTimeout(r,5));let loaded;reopened.manager.sceneGroup.traverse(m=>{if(m.geometry?.attributes.fkUV)loaded=m;});
+ assert.ok(loaded);assert.deepEqual(Array.from(loaded.geometry.attributes.position.array),positions);assert.deepEqual(Array.from(loaded.material.uniforms.fkBrush.value.image.data),texture);assert.deepEqual(reopened.errors,[]);assert.ok(!reopened.requests.some(r=>r.command==='render'));
+ await reopened.fk.inherit('frozen-copy','frozen');
+ const translated={...f.attributes,points:f.attributes.points.map(p=>({...p,x:p.x+3}))};reopened.manager.makeCurve('frozen-copy',translated);for(let i=0;i<200&&reopened.manager.sceneGroup.children.filter(m=>m.children.some(c=>c.geometry?.attributes.fkUV)).length<2;i++)await new Promise(r=>setTimeout(r,5));
+ const groups=reopened.manager.sceneGroup.children.filter(m=>m.children.some(c=>c.geometry?.attributes.fkUV));assert.equal(groups.length,2);
+ const copied=groups.at(-1).children[0];assert.ok(Array.from(copied.geometry.attributes.position.array).every((v,i)=>Math.abs(v-positions[i]-(i%3===0?3:0))<1e-5));
+ reopened.manager.removeCurve('frozen');await settled();assert.ok(copied.parent);assert.deepEqual(reopened.errors,[]);
+});
+
+test('undo while finished tiles load cannot leave retained live paint or revive it later',async()=>{
+ const f=fixture(new Map(),null,null,{nativeStreaming:true});f.manager.makeCurve('live',f.attributes);await settled();const {mesh}=f.manager.getGeomFromInfo(f.manager.curveIdToGeomInfo.get('live'));mesh.geometry.setDrawRange(0,6);f.fk.setBindings({RECT:'rect'});await f.fk.preview(mesh,{...f.attributes,sourceTemplate:true});
+ let release,loading=false;const gate=new Promise(r=>release=r),post=f.context.webkit.messageHandlers.FeatherKrita.postMessage;
+ f.context.webkit.messageHandlers.FeatherKrita.postMessage=async b=>{if(b.command==='loadStrokeTile'){loading=true;await gate;}return post(b);};
+ f.fk.birth('undone',f.attributes);mesh.geometry.setDrawRange(0,0);f.fk.preview(mesh,{});f.manager.makeCurve('undone',f.attributes);
+ for(let i=0;i<300&&!loading;i++)await new Promise(r=>setTimeout(r,5));assert.ok(loading);
+ f.manager.removeCurve('undone');release();await new Promise(r=>setTimeout(r,30));let visible=false;f.manager.sceneGroup.traverse(m=>{visible||=!!m.geometry?.attributes.fkUV;});assert.equal(visible,false);assert.deepEqual(f.errors,[]);
+ f.manager.makeCurve('undone',f.attributes);for(let i=0;i<300&&!f.manager.sceneGroup.children.some(m=>m.children.some(c=>c.geometry?.attributes.fkUV));i++)await new Promise(r=>setTimeout(r,5));assert.ok(f.manager.sceneGroup.children.some(m=>m.children.some(c=>c.geometry?.attributes.fkUV)));assert.deepEqual(f.errors,[]);
 });

@@ -21,6 +21,7 @@
   let nextPreviewSession=0, previewReadyAt=0;
   const inputPreviews=new WeakMap();
   const liveRecords=new WeakMap();
+  const retainedStrokes=new WeakMap();
   function sameHostPath(a,b){return a.size===b.size&&a.shape===b.shape&&a.points?.length===b.points?.length&&a.points.every((p,i)=>xyz(p).every((v,k)=>v===xyz(b.points[i])[k]));}
   const MAX_TEXTURE_BYTES = 64 * 1024 * 1024;
   const post = body => root.webkit.messageHandlers.FeatherKrita.postMessage(body);
@@ -305,7 +306,7 @@
     if(!preset){artworks.set(id,Promise.resolve(null));return;}
     const record={version:2,preset,paintOrder:newPaintOrder(id),attributes:clone(attributes)};
     const stream=gesture?.streams?.find(s=>!s.claimed&&s.preset===preset&&s.basis&&Math.hypot(...sub(xyz(attributes.points[0]),s.basis.origin))<Math.max(attributes.size*.1,.0001));
-    if(stream){stream.claimed=true;stream.finishAttributes=clone(attributes);liveRecords.set(record,stream);}
+    if(stream){stream.claimed=true;stream.finishAttributes=clone(attributes);retainStream(stream);liveRecords.set(record,stream);}
     artworks.set(id,Promise.resolve(record));save(id,record).catch(fail);
   }
   function artwork(id) {
@@ -413,6 +414,18 @@
   }
   const rendering=new WeakMap();
   function nativeSerial(body){const job=renderTail.then(()=>checked(body));renderTail=job.catch(()=>{});return job;}
+  function retainStream(s){
+    if(s.retained)return;s.retained=true;
+    const original=s.holder.manager.getGeomFromInfo({}),geometry=new api.Geometry();
+    for(const [name,a]of Object.entries(original.geometry.attributes))if(name!=='fkHide')geometry.setAttribute(name,new api.Attribute(a.array.slice(0,a.itemSize*4),a.itemSize,a.normalized));
+    geometry.setIndex(new api.Attribute(new Uint16Array([0,2,1,0,3,2]),1));geometry.setDrawRange(0,6);
+    const mesh=new api.Mesh(geometry,original.mesh.material.clone());mesh.matrixAutoUpdate=false;mesh.matrix.copy(original.mesh.matrix);mesh.castShadow=original.mesh.castShadow;mesh.receiveShadow=original.mesh.receiveShadow;
+    s.template={geometry,mesh};s.holder.manager.getGeomFromInfo=()=>s.template;
+  }
+  function releaseRetained(s){
+    if(!s||s.released)return;s.released=true;clearState(states.get(s.holder.manager));s.holder.manager.curveIdToGeomInfo.clear();
+    s.template?.geometry.dispose();s.template?.mesh.material.dispose();managers.delete(s.holder.manager);
+  }
   function streamFrame(s,x,y,width,height,scaleFactor=1,points=s.worldPoints,normals=s.worldNormals){
     const scale=s.basis.scale*scaleFactor,minX=(x-8192)/s.basis.scale,maxY=(8192-y)/s.basis.scale;
     return {...s.basis,scale,width,height,minX,maxX:minX+width/scale,maxY,minY:maxY-height/scale,points,normals,projected:points.map(p=>{const d=sub(p,s.basis.origin);return [dot(d,s.basis.u),dot(d,s.basis.v)];})};
@@ -444,24 +457,40 @@
       const points=selected.map(i=>s.worldPoints[i]),normals=selected.map(i=>s.worldNormals[i]);if(points.length===1){points.push(points[0]);normals.push(normals[0]);}
       const a={...s.attributes,points,normals,pressures:[]},frame=streamFrame(s,tile.x,tile.y,tile.width,tile.height,1,points,normals);
       const record={version:2,preview:true,preset:s.preset,attributes:a,frame,surface:s.backdrops.get(key),streamClip:true,result:{...tile,pixels:result.pixels,pixelBytes:bytes.subarray(tile.offset,tile.offset+size),composited:result.composited}};
-      if(!record.surface)record.guideSurface=guideSurface(frame,a);
-      const entry=await loadAssets(record,active);if(!active()){releasePreviewAsset(entry);return;}
       const previous=state.records.get(id);
+      if(previous?.streamGuide)record.guideSurface=previous.tileRecord.guideSurface;
+      else if(!record.surface)record.guideSurface=guideSurface(frame,a);
+      const entry=await loadAssets(record,active);if(!active()){releasePreviewAsset(entry);return;}
       // On a fixed Guide, geometry and UVs are independent of how much ink has
       // accumulated. Update its two small textures, not the surface mesh.
       if(previous?.streamGuide&&record.guideSurface){
         entry.refs++;const old=previous.entry;previous.entry=entry;
         previous.mesh.material.uniforms.fkBrush.value=entry.texture;previous.mesh.material.uniforms.fkCoverage.value=entry.mask;
-        old.refs--;releasePreviewAsset(old);api.redraw?.();continue;
+        previous.tileRecord=record;old.refs--;releasePreviewAsset(old);api.redraw?.();continue;
       }
       const info={attributes:a,numOfPoints:1,geomAttributes:0,geomIndex:0,fkIndexCount:6};s.holder.manager.curveIdToGeomInfo.set(id,info);
       await replaceCurve(s.holder.manager,state,id,info,record,entry,a,active);
-      if(state.records.has(id))state.records.get(id).streamGuide=!!record.guideSurface;
+      if(state.records.has(id)){state.records.get(id).streamGuide=!!record.guideSurface;state.records.get(id).tileRecord=record;}
       const mesh=state.records.get(id)?.mesh;if(mesh){mesh.material.uniforms.fkTileClip={value:[1/258,1/258,257/258,257/258]};if(!mesh.material.userData.fkTileClip){mesh.material.fragmentShader='uniform vec4 fkTileClip;\n'+mesh.material.fragmentShader.replace('vec4 fkSample =','if(any(lessThan(fkTexCoord,fkTileClip.xy))||any(greaterThanEqual(fkTexCoord,fkTileClip.zw))) discard;\nvec4 fkSample =');mesh.material.userData.fkTileClip=true;mesh.material.needsUpdate=true;}}
     }
   }
   async function streamedResult(s,result){
     const output={result,frame:streamFrame(s,result.streamX,result.streamY,result.width,result.height,result.streamScale),attributes:{...s.attributes,points:s.worldPoints,normals:s.worldNormals,pressures:[]}};
+    const tiles=[];
+    for(const [key,shown]of states.get(s.holder.manager)?.records||[]){
+      if(!shown.tileRecord)continue;
+      const geometry=shown.mesh.geometry,used=geometry.userData.fkUsedIndices??geometry.index.count,position=geometry.attributes.position,normal=geometry.attributes.normalUp||geometry.attributes.normalSide,uv=geometry.attributes.fkUV;
+      const patch={version:1,positions:[],normals:[],uv:[]};
+      for(let i=0;i<used;i++){const j=geometry.index.array[i];patch.positions.push(...position.array.subarray(j*3,j*3+3));patch.normals.push(...(normal?normal.array.subarray(j*3,j*3+3):[0,0,1]));patch.uv.push(...uv.array.subarray(j*2,j*2+2));}
+      const r=shown.tileRecord,bytes=r.result.pixelBytes;let binary='';
+      for(let i=0;i<bytes.length;i+=16384){binary+=String.fromCharCode(...bytes.subarray(i,i+16384));if(i%65536===0)await new Promise(resolve=>setTimeout(resolve,0));}
+      const id=s.id+'-'+key.replace(/[^a-zA-Z0-9_-]/g,'_');
+      // Store each immutable raster+surface independently. Large strokes never
+      // have to cross WebKit in one giant JSON or be resampled into one image.
+      const tile={frame:{...r.frame,points:[],normals:[],projected:[]},guideSurface:patch,clip:[1/258,1/258,257/258,257/258],result:{width:r.result.width,height:r.result.height,composited:r.result.composited,rawPixels:root.btoa(binary)}};
+      await checked({command:'saveStrokeTile',id,record:tile});tiles.push({id});
+    }
+    if(tiles.length){output.result={...result,tiles};return output;}
     if(s.meta.samplesBackdrop&&s.backdrops.size){
       const canvas=document.createElement('canvas');canvas.width=result.width;canvas.height=result.height;const ctx=canvas.getContext('2d');ctx.imageSmoothingEnabled=false;
       let first;
@@ -494,11 +523,9 @@
       }
       const body={command:'render',preset:s.preset,previewSession:s.id,streamFrom:s.sent,points:batch,streamTiles:await streamBackground(s,batch)};
       if(!s.started)Object.assign(body,{streamBegin:true,width:16384,height:16384,size:128,color:s.attributes.color.slice(0,3),opacity:s.attributes.color[3]??1,seed:1,streamBackdrop:!!s.meta.samplesBackdrop});
-      if(finish&&stop===end)body.streamFinish=true;
       const result=await nativeSerial(body);s.started=true;s.sent=result.streamCount;
-      if(body.streamFinish){s.ended=true;return streamedResult(s,result);}
-      if(!finish)await showStreamTiles(s,result,active);
-      while(result.pendingTiles&&!finish&&active()){
+      await showStreamTiles(s,result,active);
+      while(result.pendingTiles&&active()){
         const drained=await nativeSerial({command:'render',preset:s.preset,previewSession:s.id,streamFrom:s.sent,points:[]});await showStreamTiles(s,drained,active);result.pendingTiles=drained.pendingTiles;
       }
       if(!finish&&!active())return;
@@ -525,7 +552,7 @@
   async function renderRecord(id,record,active=()=>true,previewCache=null) {
     if(record.result)return record;
     if(liveRecords.has(record)){
-      const s=liveRecords.get(record),finished=await finishStream(s,record.attributes);record.hostAttributes=record.attributes;Object.assign(record,finished);if(id)await save(id,record);liveRecords.delete(record);return record;
+      const s=liveRecords.get(record),finished=await finishStream(s,record.attributes);record.hostAttributes=record.attributes;Object.assign(record,finished);retainedStrokes.set(record,s);if(id)await save(id,record);liveRecords.delete(record);return record;
     }
     if(rendering.has(record))return rendering.get(record);
     const job=renderTail.then(async()=>{
@@ -569,7 +596,8 @@
   function evict(){for(const [record,entry] of assets){if(textureBytes<=MAX_TEXTURE_BYTES)break;if(entry.refs||!entry.texture)continue;entry.texture.dispose();entry.mask.dispose();textureBytes-=entry.bytes;assets.delete(record);}}
   async function rawPreviewAssets(record,entry,active){
     const r=record.result,w=r.width,h=r.height,n=w*h,budget=workBudget(true,active);
-    if(!Number.isInteger(w)||!Number.isInteger(h)||w<1||h<1||w>4096||h>4096||n>2097152||!/^[-a-fA-F0-9]{36}\.rgba$/.test(r.pixels))throw new Error("Invalid live pixel response.");
+    if(!Number.isInteger(w)||!Number.isInteger(h)||w<1||h<1||w>4096||h>4096||n>2097152||(!r.rawPixels&&!/^[-a-fA-F0-9]{36}\.rgba$/.test(r.pixels)))throw new Error("Invalid live pixel response.");
+    if(r.rawPixels&&!r.pixelBytes){const binary=root.atob(r.rawPixels);r.pixelBytes=Uint8Array.from(binary,c=>c.charCodeAt(0));}
     if(!r.pixelBytes){
       const response=await root.fetch('/feather-krita-preview/'+r.pixels,{cache:'no-store'});
       if(!response.ok)throw new Error("Cannot load the live brush pixels.");
@@ -601,7 +629,7 @@
     const entry={refs:0,preview:!!record.preview,record};assets.set(record,entry);
     entry.promise=(async()=>{
       const result=record.result;
-      if(record.preview&&result.pixels)return rawPreviewAssets(record,entry,active);
+      if(result.rawPixels||(record.preview&&result.pixels))return rawPreviewAssets(record,entry,active);
       const image=new Image(),maskImage=new Image();
       image.src="data:image/png;base64,"+result.png;maskImage.src="data:image/png;base64,"+result.coverage;
       await Promise.all([image.decode(),maskImage.decode()]);
@@ -655,7 +683,8 @@
   }
   function removeReplacement(state,id){
     const record=state.records.get(id);if(!record)return;
-    record.mesh.removeFromParent();record.mesh.geometry.dispose();record.mesh.material.dispose();record.entry.refs--;
+    if(record.children)clearState(record.children);
+    record.mesh.removeFromParent();record.mesh.geometry?.dispose();record.mesh.material?.dispose();record.entry.refs--;
     state.records.delete(id);releasePreviewAsset(record.entry);evict();
   }
   function releasePreviewAsset(entry){
@@ -858,6 +887,33 @@
     if(reuse){previous.entry.refs--;releasePreviewAsset(previous.entry);}evict();api.redraw?.();
     if(guideDirty.has(record)&&!record.preview){guideDirty.delete(record);save(id,record).catch(fail);}
   }
+  async function restoreTiledCurve(manager,state,id,info,record,attributes,active){
+    const source=manager.getGeomFromInfo(info);if(!source)return;
+    // Mesh extends the host's Object3D. A scene-only container must not submit
+    // a dummy material into Feather's multiple-render-target pass.
+    const Object3D=Object.getPrototypeOf(api.Mesh.prototype).constructor;
+    const group=new Object3D(),children={generation:0,pending:new Map(),records:new Map(),hidden:new Map(),dirty:new Set()};group.isGroup=true;group.type='Group';
+    const tileManager={sceneGroup:group,getGeomFromInfo:()=>source};
+    try{
+      for(let i=0;i<record.result.tiles.length;i++){
+        if(!active())break;
+        const tile=(await checked({command:'loadStrokeTile',id:record.result.tiles[i].id})).record;if(!tile)throw new Error('The saved paint tile is unavailable.');
+        const frame={...tile.frame,points:record.attributes.points.map(xyz),normals:(record.attributes.normals||[]).map(xyz)};
+        frame.projected=frame.points.map(p=>{const d=sub(p,frame.origin);return [dot(d,frame.u),dot(d,frame.v)];});
+        const part={...tile,frame,preset:record.preset,attributes:record.attributes,paintOrder:record.paintOrder};
+        const entry=await loadAssets(part,active);if(!active()){evict();break;}
+        const key=id+'-part-'+i;await replaceCurve(tileManager,children,key,info,part,entry,attributes,active);
+        const mesh=children.records.get(key)?.mesh;
+        if(mesh){mesh.material.uniforms.fkTileClip={value:tile.clip};mesh.material.fragmentShader='uniform vec4 fkTileClip;\n'+mesh.material.fragmentShader.replace('vec4 fkSample =','if(any(lessThan(fkTexCoord,fkTileClip.xy))||any(greaterThanEqual(fkTexCoord,fkTileClip.zw))) discard;\nvec4 fkSample =');mesh.material.needsUpdate=true;}
+      }
+      if(!active()){clearState(children);releaseRetained(retainedStrokes.get(record));retainedStrokes.delete(record);return;}
+      removeReplacement(state,id);
+      const syncVisibility=()=>{group.visible=source.mesh.visible;for(const child of children.records.values())child.syncVisibility();};
+      syncVisibility();manager.sceneGroup.add(group);hideCurve(manager,info,state,id);
+      state.records.set(id,{mesh:group,children,entry:{refs:1},syncVisibility,info,source:source.geometry});
+      releaseRetained(retainedStrokes.get(record));retainedStrokes.delete(record);api.redraw?.();
+    }catch(error){clearState(children);releaseRetained(retainedStrokes.get(record));retainedStrokes.delete(record);throw error;}
+  }
   function register(manager){if(!states.has(manager)){states.set(manager,{depth:0,generation:0,records:new Map(),hidden:new Map(),pending:new Map(),dirty:new Set()});managers.add(manager);}return states.get(manager);}
   function synchronize(manager) {
     const state=states.get(manager);if(!state||state.depth)return;
@@ -876,15 +932,15 @@
         if(record.hostAttributes&&sameHostPath(attributes,record.hostAttributes))attributes={...record.attributes,color:attributes.color,materialStyle:attributes.materialStyle};
         hideCurve(manager,info,state,id);
         token.masked=true;
-        const restore=async()=>{const entry=await loadAssets(record);if(active())await replaceCurve(manager,state,id,info,record,entry,attributes,active);};
+        const restore=async()=>{if(record.result.tiles)return restoreTiledCurve(manager,state,id,info,record,attributes,active);const entry=await loadAssets(record);if(active())await replaceCurve(manager,state,id,info,record,entry,attributes,active);releaseRetained(retainedStrokes.get(record));retainedStrokes.delete(record);};
         if(record.result){const ready=restore();restoringSurfaces.add(ready);try{await ready;}finally{restoringSurfaces.delete(ready);}return;}
         const rendered=await renderRecord(info.fkRecord?null:id,record,info.fkRecord?active:()=>true);
-        if(!rendered||!active())return;
+        if(!rendered||!active()){releaseRetained(retainedStrokes.get(record));retainedStrokes.delete(record);return;}
         if(record.hostAttributes&&sameHostPath(attributes,record.hostAttributes))attributes={...record.attributes,color:attributes.color,materialStyle:attributes.materialStyle};
         const ready=restore();restoringSurfaces.add(ready);try{await ready;}finally{restoringSurfaces.delete(ready);}
       }).catch(error=>{
         if(active()){const h=state.hidden.get(id);if(h){h.mask.array.fill(0,h.offset,h.offset+h.count);h.mask.needsUpdate=true;state.hidden.delete(id);}}
-        fail(error);
+        if(active())fail(error);
       }).finally(()=>{if(state.pending.get(id)===token)state.pending.delete(id);});
     }
     state.dirty.clear();
@@ -1060,7 +1116,10 @@
     let holder=previews.get(mesh);
     const stop=!mesh.geometry.drawRange.count||!attributes.shape;
     if(stop){
-      if(holder){holder.epoch++;clearTimeout(holder.timer);holder.timer=null;holder.latest=null;holder.signature=null;closePreview(holder.cache);holder.cache={};const s=holder.stream;holder.stream=null;if(s&&!s.claimed)s.tail.then(()=>s.started&&!s.ended?nativeSerial({command:'render',preset:s.preset,previewSession:s.id,previewEnd:true}):null).catch(fail);clearState(states.get(holder.manager));holder.manager.curveIdToGeomInfo.clear();}
+      if(holder){holder.epoch++;clearTimeout(holder.timer);holder.timer=null;holder.latest=null;holder.signature=null;closePreview(holder.cache);holder.cache={};const s=holder.stream;holder.stream=null;
+        if(s?.claimed){previews.delete(mesh);mesh.removeEventListener('removed',holder.removed);}
+        else{if(s)s.tail.then(()=>s.started&&!s.ended?nativeSerial({command:'render',preset:s.preset,previewSession:s.id,previewEnd:true}):null).catch(fail);clearState(states.get(holder.manager));holder.manager.curveIdToGeomInfo.clear();}
+      }
       gesture=null;return;
     }
     if(!gesture)gesture={bindings:{...bindings}};
@@ -1068,7 +1127,7 @@
     if(!holder){
       const manager={sceneGroup:mesh.parent,curveIdToGeomInfo:new Map(),getGeomFromInfo:()=>({geometry:mesh.geometry,mesh})};
       holder={manager,timer:null,latest:null,epoch:0,running:false,disposed:false,signature:null,cache:{}};previews.set(mesh,holder);register(manager);
-      mesh.addEventListener("removed",()=>{holder.disposed=true;holder.epoch++;holder.latest=null;closePreview(holder.cache);holder.cache={};holder.signature=null;clearTimeout(holder.timer);clearState(states.get(manager));managers.delete(manager);});
+      holder.removed=()=>{holder.disposed=true;holder.epoch++;holder.latest=null;closePreview(holder.cache);holder.cache={};holder.signature=null;clearTimeout(holder.timer);clearState(states.get(manager));managers.delete(manager);};mesh.addEventListener("removed",holder.removed);
     }
     const count=attributes.points?.length || 0;
     if(count<2)return;

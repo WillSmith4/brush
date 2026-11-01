@@ -67,9 +67,21 @@ coverage mask travel through
 the app's local resource handler. A small result token replaces two base64 PNGs
 in the WebKit reply. Raw pixels go directly into GPU data textures; live paint
 does not run PNG compression, base64 encoding, image decode or canvas readback.
-Pencil-up finishes this same paint session and bakes its output into the existing
-PNG record format. Large completed rasters retain the existing roughly 2MP
-storage budget. Existing documents and already painted strokes are not rerendered.
+Pencil-up finishes the same native paint session, but displayed artwork retains
+the exact live tiles and their captured surface geometry. Tiles are stored as
+immutable records in `StrokeTiles-v1`; the existing stroke record contains their
+IDs and the legacy baked PNG fallback. Rendering uses the tiles, so a large
+stroke is not visibly replaced by a resampled whole-stroke raster. Existing
+documents and already painted strokes are not rerendered.
+
+Claimed live meshes remain visible while the last samples and immutable tile
+records finish saving. Replacement is atomic once all saved tiles are ready.
+Geometry, UVs, coverage, depth bias and tile-border clipping survive the handoff
+and reopening, even if the drawing Guide is no longer available for raycasts.
+For a Guide tile, texture updates keep its already chosen surface instead of
+reselecting a support during finalization. Copies share immutable tile files;
+transforms/visibility continue through the host curve. Stroke history retains
+these files just like the existing per-stroke sidecars.
 
 Earlier prefix-render APIs remain available to older adapters. Current drawing
 uses explicit sequence numbers and new samples, so changing stroke bounds cannot
@@ -99,8 +111,9 @@ pixel scanning that cannot affect their geometry. The native brush resolution,
 sampling, preset dynamics, and final paint representation remain unchanged.
 
 The saved streaming record retains its working frame and painted path, plus the
-host path needed to recognize unchanged curves on reopen. Finished brush pixels
-therefore come from the live paint session rather than a second stroke simulation.
+host path needed to recognize unchanged curves on reopen. Frozen tile surfaces
+therefore come from the displayed live meshes rather than a second surface
+reconstruction at Pencil-up.
 
 The native asynchronous render entry point prepares resources on Qt's owner
 thread, then waits for Krita and encodes output on a background queue. Completion
