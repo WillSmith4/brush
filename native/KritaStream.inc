@@ -37,11 +37,16 @@ QJsonObject renderStream(RenderJob &job,const QJsonObject &request) {
     for(const auto &p:points){const auto info=point(p.toArray());require(info.pos().x()>=0&&info.pos().x()<16384&&info.pos().y()>=0&&info.pos().y()<16384,"Live stroke exceeds the working surface.");}
     const auto backgrounds=request["streamTiles"].toArray();require(backgrounds.size()<=64,"Too many backdrop tiles.");
     streamBarrier(job,[&]{
+        QVector<QRect> seeded;
         for(const auto &v:backgrounds){const auto t=v.toObject();const int x=t["x"].toInt(-1),y=t["y"].toInt(-1);require(x>=0&&y>=0&&x<16384&&y<16384&&x%256==0&&y%256==0,"Invalid backdrop tile.");const quint64 key=(quint64(x)<<32)|quint32(y);if(job.loadedTiles.contains(key))continue;
             const QByteArray bytes=QByteArray::fromBase64(t["png"].toString().toLatin1());require(bytes.size()<1048576,"Backdrop tile too large.");QImage image;require(image.loadFromData(bytes,"PNG")&&image.size()==QSize(256,256),"Invalid backdrop image.");
-            job.base->convertFromQImage(image,nullptr,x,y);job.layer->paintDevice()->convertFromQImage(image,nullptr,x,y);job.loadedTiles.insert(key);
+            job.base->convertFromQImage(image,nullptr,x,y);job.layer->paintDevice()->convertFromQImage(image,nullptr,x,y);job.loadedTiles.insert(key);seeded.append(QRect(x,y,256,256));
         }
+        if(!seeded.isEmpty())static_cast<StreamLayer*>(job.layer.data())->backdropChanged(seeded);
     });
+    // An overlay-mode smudge may read the merged image. A second barrier waits
+    // for these projection updates without ending its existing paintop.
+    if(!backgrounds.isEmpty()){if(job.started)streamBarrier(job,[]{});else job.image->waitForDone();}
     if(!points.isEmpty()){
         QJsonArray addition;if(job.started)addition.append(job.points.last());for(const auto &p:points)addition.append(p);
         job.points=addition;job.submitted=job.started?1:0;submitPoints(job);job.streamCount+=points.size();

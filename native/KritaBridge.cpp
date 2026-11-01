@@ -252,6 +252,7 @@ public:
         KisPaintLayer::setDirty(rects);
     }
     QRegion takeDirty() { std::lock_guard<std::mutex> lock(mutex); const auto r = dirty; dirty = QRegion(); return r; }
+    void backdropChanged(const QVector<QRect> &rects) { KisPaintLayer::setDirty(rects); }
 private:
     std::mutex mutex; QRegion dirty;
 };
