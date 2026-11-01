@@ -45,12 +45,13 @@ small surface separation in that shader instead of relying on polygon offset.
 This prevents a single stroke from fighting its drawing support. The depth bias
 is disabled during smudge capture and restored afterward.
 
-Live preview uses the full native brush renderer at the same pixel density,
-point sampling, size, opacity, pressure, seed, and resource settings as committed
-paint. It retains the last completed native image while coalescing new Pencil
-input. It does not approximate the preset by repeating a single cached tip.
-Updates remain asynchronous; complex presets can lag behind the latest Pencil
-position while their full native result is computed.
+Live drawing uses one persistent native brush stroke with the preset's paintop,
+pressure, spacing and random state retained. Each stable spline sample is sent
+once, in batches of at most 64. The mutable trailing Catmull-Rom segment waits
+for its next control point or Pencil-up. The drawing plane and pixel scale are
+fixed for the gesture rather than recomputed from an expanding stroke rectangle.
+The camera-facing plane projects the visible drawing surface; Guide triangles
+and sampled substrate depth place the painted pixels back in the scene.
 
 Injected input now enters a separate preview path before the host builds its
 tube geometry. It keeps the host's cached surface projection, spline, pressure,
@@ -59,16 +60,25 @@ While rendering is busy, only the latest Pencil input waits. The hidden host
 tube and per-vertex adapter metadata are not rebuilt for every input event.
 Ordinary, uninjected tools continue through the original host input path.
 
-The native renderer submits paint jobs on a serial background queue and keeps
-up to four compatible preview strokes open. It appends points only when the
-previous points, raster coordinates, dimensions, brush settings and backdrop
-are identical. Changed projections or revised spline samples require replay;
-this intentionally preserves appearance instead of reusing incompatible ink.
-The first live snapshot for a preset is compared with the completed native
-renderer on the device. If its output differs, that preset uses complete renders.
-Pencil-up closes the live sessions. A quiet interval between expensive preview
-requests reserves time for the host render loop and input; completed paint is
-not subject to this preview pacing.
+The native renderer submits paint jobs on a serial background queue. Dirty
+regions are tracked on its paint layer. Only changed 256px tiles (with a 1px
+sampling border) are returned, at most 16 per packet. RGBA bytes and a one-byte
+coverage mask travel through
+the app's local resource handler. A small result token replaces two base64 PNGs
+in the WebKit reply. Raw pixels go directly into GPU data textures; live paint
+does not run PNG compression, base64 encoding, image decode or canvas readback.
+Pencil-up finishes this same paint session and bakes its output into the existing
+PNG record format. Large completed rasters retain the existing roughly 2MP
+storage budget. Existing documents and already painted strokes are not rerendered.
+
+Earlier prefix-render APIs remain available to older adapters. Current drawing
+uses explicit sequence numbers and new samples, so changing stroke bounds cannot
+trigger a replay of earlier paint. Smudge seeds each newly visited substrate tile
+once and continues mixing on the existing native layer. A spatial index bounds
+surface lookup for dirty tiles; fixed Guide meshes survive texture updates.
+The sparse native working surface is 16384 pixels per side at 128 pixels per
+brush diameter; leaving that working area reports an error instead of silently
+dropping paint. Actual device latency and complex presets still require testing.
 
 Feather densifies spline positions without densifying its source normals. The
 adapter resamples those normals before building live paint, preventing undefined
@@ -88,9 +98,9 @@ surface calculation, and unchanged Guide faces skip nearest-path searches and
 pixel scanning that cannot affect their geometry. The native brush resolution,
 sampling, preset dynamics, and final paint representation remain unchanged.
 
-The original
-raw surface normals are retained alongside densified preview normals so both
-preview and committed paint construct the same raster frame.
+The saved streaming record retains its working frame and painted path, plus the
+host path needed to recognize unchanged curves on reopen. Finished brush pixels
+therefore come from the live paint session rather than a second stroke simulation.
 
 The native asynchronous render entry point prepares resources on Qt's owner
 thread, then waits for Krita and encodes output on a background queue. Completion
@@ -116,7 +126,9 @@ Run the JavaScript contracts with `npm ci --ignore-scripts && npm test`.
 Device compilation and static binary inspection are separate gates. A successful
 dependency build alone does not verify the renderer or demonstrate operation on
 an iPad. The revised native engine compiled successfully in Actions run
-41266658745. Windows tests use a native-response fixture; the device library
+41273639724 (streaming engine). Run 41270803291 supplied the intermediate raw
+transport implementation and was not delivered as the real-time fix.
+Windows tests use a native-response fixture; the device library
 cannot execute there. Actual brush appearance and mixing need an iPad run.
 
 The host-specific binary and frontend packaging are performed locally. Original

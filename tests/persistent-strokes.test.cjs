@@ -7,7 +7,7 @@ const clone=o=>JSON.parse(JSON.stringify(o));
 const tick=()=>new Promise(r=>setImmediate(r));
 async function settled(){for(let i=0;i<12;i++)await tick();}
 function fixture(store=new Map(),deferRender,deferOutline,extraApi={}){
- const requests=[],errors=[];
+ const requests=[],errors=[],pixelPackets=new Map(),streams=new Map();let pixelSequence=0;
  class Image {set src(value){Object.assign(this,JSON.parse(Buffer.from(value.split(',')[1],'base64').toString()));}async decode(){}}
  const context={console,setTimeout,clearTimeout,queueMicrotask,Image,CustomEvent:class{},dispatchEvent(){},document:{readyState:'complete',createElement(){
   let image;return {getContext(){return {clearRect(){},drawImage(i){image=i;},getImageData(){const data=new Uint8ClampedArray(image.width*image.height*4);if(image.depthSplit){for(let y=0;y<image.height;y++)for(let x=0;x<image.width;x++){const height=x<image.width/2?0:1.5,z=(8-height-.001)/(16-.001),value=Math.round(z*16777215),at=(y*image.width+x)*4;data.set([value>>16,(value>>8)&255,value&255,255],at);}return {data};}for(let y=0;y<image.height;y++)for(let x=0;x<image.width;x++)if(image.tip==='rect'||(x/image.width-.5)**2+(y/image.height-.5)**2<.22)data[(y*image.width+x)*4+3]=255;return {data};}}}};
@@ -18,17 +18,33 @@ function fixture(store=new Map(),deferRender,deferOutline,extraApi={}){
    if(body.command==='loadStroke')return {ok:true,record:store.has(body.id)?clone(store.get(body.id)):null};
    if(body.command==='presetInfo'){
     if(deferOutline)await deferOutline;
-    return {ok:true,extent:1,samplesBackdrop:false,previewSessions:!!extraApi.nativeSessions,outline:body.preset==='rect'?[[[-.5,-.25],[.5,-.25],[.5,.25],[-.5,.25]]]:[[[0,-.5],[.5,0],[0,.5],[-.5,0]]]};
+    return {ok:true,extent:1,samplesBackdrop:false,strokeStreaming:extraApi.nativeStreaming?1:undefined,previewPixels:!!extraApi.nativePixels,previewSessions:!!extraApi.nativeSessions,outline:body.preset==='rect'?[[[-.5,-.25],[.5,-.25],[.5,.25],[-.5,.25]]]:[[[0,-.5],[.5,0],[0,.5],[-.5,0]]]};
    }
    if(body.command==='selectPreset')return {ok:true,bindings:{RECT:'saved'}};
    if(body.command==='render'){
-    if(body.previewEnd)return {ok:true,closed:true};
+    if(body.previewEnd){streams.delete(body.previewSession);return {ok:true,closed:true};}
     if(deferRender)await deferRender;
+    if(body.streamFrom!==undefined){
+     if(body.streamBegin){assert.ok(!streams.has(body.previewSession));streams.set(body.previewSession,{count:0,points:[]});}
+     const state=streams.get(body.previewSession);assert.ok(state);assert.equal(body.streamFrom,state.count);assert.ok(body.points.length<=64);
+     state.count+=body.points.length;state.points.push(...body.points);
+     const x=Math.floor(state.points[0][0]/256)*256,y=Math.floor(state.points[0][1]/256)*256;
+     if(body.streamFinish){const png=Buffer.from(JSON.stringify({width:256,height:256,tip:'rect'})).toString('base64');streams.delete(body.previewSession);return {ok:true,width:256,height:256,png,coverage:png,composited:false,streamCount:state.count,streamX:x,streamY:y,streamScale:1};}
+     if(extraApi.quietStreaming)return {ok:true,tiles:[],pixels:'',streamCount:state.count,pendingTiles:false,composited:false};
+     const token='00000000-0000-4000-8000-'+String(++pixelSequence).padStart(12,'0')+'.rgba',n=258*258,bytes=new Uint8Array(n*5);for(let i=0;i<n;i++)bytes.set([50,100,200,255],i*4);bytes.fill(255,n*4);pixelPackets.set(token,bytes);
+     return {ok:true,tiles:[{x:x-1,y:y-1,width:258,height:258,offset:0}],pixels:token,streamCount:state.count,pendingTiles:false,composited:false};
+    }
+    if(body.previewPixels){
+     const token='00000000-0000-4000-8000-'+String(++pixelSequence).padStart(12,'0')+'.rgba',n=body.width*body.height,bytes=new Uint8Array(n*5);
+     for(let i=0;i<n;i++)bytes.set([Math.floor(i/body.width)%256,i%body.width%256,80,128],i*4);bytes.fill(255,n*4);
+     pixelPackets.set(token,bytes);return {ok:true,width:body.width,height:body.height,pixels:token,composited:false};
+    }
     const png=Buffer.from(JSON.stringify({width:body.width,height:body.height,tip:body.preset,input:JSON.stringify(body)})).toString('base64');
     return {ok:true,width:body.width,height:body.height,png,coverage:png,composited:false};
    }
    return {ok:true};
  }}}}};
+ if(extraApi.nativePixels||extraApi.nativeStreaming)context.fetch=async url=>{const token=url.split('/').at(-1),bytes=pixelPackets.get(token);pixelPackets.delete(token);return {ok:!!bytes,arrayBuffer:async()=>extraApi.invalidPixels?new ArrayBuffer(5):bytes.buffer};};
  vm.createContext(context);vm.runInContext(runtime,context);
  class Manager{
   constructor(){this.sceneGroup=new THREE.Group();this.curveIdToGeomInfo=new Map();this.geoms=new Map();}
@@ -56,7 +72,7 @@ function fixture(store=new Map(),deferRender,deferOutline,extraApi={}){
  const attributes={shape:'RECT',size:1,color:[50,100,200,.75],pressures:[.2,.5,1],points:[{x:0,y:0,z:0},{x:1,y:0,z:0},{x:2,y:0,z:0}],normals:[{x:0,y:0,z:1},{x:0,y:0,z:1},{x:0,y:0,z:1}]};
  const manager=new Manager(),fk=context.FeatherKrita;
  function draw(id,a=attributes){fk.birth(id,a);manager.makeCurve(id,a);}
- return {context,manager,fk,attributes,draw,requests,errors,store};
+ return {context,manager,fk,attributes,draw,requests,errors,store,pixelPackets,streams};
 }
 test('Inject affects only new strokes; Restore retains Krita artwork and permits new original strokes',async()=>{
  const {fk,manager,draw,attributes,errors,requests,store}=fixture();
@@ -366,4 +382,59 @@ test('ending direct input before its scheduled work drops it and keeps original 
  f.fk.setBindings({RECT:'rect'});assert.equal(f.fk.inputPreview(host,{clientPointers:[],pressures:[]}),true);f.fk.endInputPreview(host);
  await new Promise(r=>setTimeout(r,25));assert.equal(projections,0);assert.deepEqual(f.errors,[]);
  f.fk.setBindings({});assert.equal(f.fk.inputPreview(host,{clientPointers:[],pressures:[]}),false);assert.equal(projections,0);
+});
+
+test('raw preview pixels reach GPU textures with correct row orientation and without a saved raw result',async()=>{
+ const f=fixture(new Map(),null,null,{nativePixels:true});f.manager.makeCurve('live',f.attributes);await settled();
+ const {mesh}=f.manager.getGeomFromInfo(f.manager.curveIdToGeomInfo.get('live'));mesh.geometry.setDrawRange(0,60);
+ f.fk.setBindings({RECT:'rect'});await f.fk.preview(mesh,f.attributes);
+ const paint=f.manager.sceneGroup.children.find(m=>m.geometry.attributes.fkUV);assert.ok(paint);assert.deepEqual(f.errors,[]);
+ const texture=paint.material.uniforms.fkBrush.value,mask=paint.material.uniforms.fkCoverage.value;
+ assert.equal(texture.isDataTexture,true);assert.equal(texture.flipY,false);assert.equal(texture.image.data[0],(texture.image.height-1)%256);
+ assert.equal(texture.image.data[(texture.image.height-1)*texture.image.width*4],0);
+ assert.equal(mask.format,1028);assert.ok(mask.image.data.every(v=>v===255));assert.match(paint.material.fragmentShader,/fkCoverage, fkTexCoord\)\.r/);
+ assert.equal(f.pixelPackets.size,0);assert.ok(f.requests.some(r=>r.previewPixels&&!r.previewSession));
+ mesh.geometry.setDrawRange(0,0);f.fk.preview(mesh,{});f.draw('final');await settled();
+ assert.ok(f.store.get('final').result.png);assert.equal(f.store.get('final').result.pixels,undefined);
+ assert.ok(!f.requests.some(r=>r.previewEnd));
+});
+
+test('truncated raw packets are rejected before creating textures',async()=>{
+ const f=fixture(new Map(),null,null,{nativePixels:true,invalidPixels:true});f.manager.makeCurve('live',f.attributes);await settled();
+ const {mesh}=f.manager.getGeomFromInfo(f.manager.curveIdToGeomInfo.get('live'));mesh.geometry.setDrawRange(0,60);f.fk.setBindings({RECT:'rect'});
+ await f.fk.preview(mesh,f.attributes);assert.equal(f.errors.length,1);assert.match(f.errors[0],/pixel dimensions/);
+ assert.ok(!f.manager.sceneGroup.children.some(m=>m.geometry.attributes.fkUV));mesh.geometry.setDrawRange(0,0);f.fk.preview(mesh,{});
+});
+
+test('one live native stroke appends each sample once and bakes that same stroke at Pencil-up',async()=>{
+ const f=fixture(new Map(),null,null,{nativeStreaming:true});
+ const points=Array.from({length:240},(_,i)=>({x:i/240,y:Math.sin(i*.03)*.1,z:0})),a={...f.attributes,points,normals:points.map(()=>({x:0,y:0,z:1})),pressures:[]};
+ f.manager.makeCurve('live',a);await settled();const {mesh}=f.manager.getGeomFromInfo(f.manager.curveIdToGeomInfo.get('live'));mesh.geometry.setDrawRange(0,6);f.fk.setBindings({RECT:'rect'});
+ await f.fk.preview(mesh,{...a,points:points.slice(0,120),normals:a.normals.slice(0,120),sourceTemplate:true});
+ await f.fk.preview(mesh,{...a,sourceTemplate:true});
+ assert.deepEqual(f.errors,[]);const updates=f.requests.filter(r=>r.streamFrom!==undefined);assert.equal(updates.filter(r=>r.streamBegin).length,1);assert.equal(updates.reduce((n,r)=>n+r.points.length,0),237);
+ assert.ok(updates.every(r=>r.points.length<=64));assert.equal(f.streams.size,1);assert.ok(f.manager.sceneGroup.children.some(m=>m.geometry.attributes.fkUV));
+ f.fk.birth('saved-stream',a);mesh.geometry.setDrawRange(0,0);f.fk.preview(mesh,{});f.manager.makeCurve('saved-stream',a);
+ for(let i=0;i<1000&&!f.store.get('saved-stream')?.result;i++)await new Promise(r=>setTimeout(r,5));
+ assert.ok(f.store.get('saved-stream')?.result?.png);assert.deepEqual(f.errors,[]);assert.equal(f.streams.size,0);
+ const all=f.requests.filter(r=>r.streamFrom!==undefined);assert.equal(all.reduce((n,r)=>n+r.points.length,0),240);assert.equal(all.filter(r=>r.streamFinish).length,1);
+ assert.ok(!f.requests.some(r=>r.command==='render'&&r.streamFrom===undefined&&!r.previewEnd));
+ assert.equal(f.store.get('saved-stream').result.pixels,undefined);assert.equal(f.pixelPackets.size,0);
+ const reopened=fixture(f.store);reopened.manager.makeCurve('saved-stream',a);await settled();assert.deepEqual(reopened.errors,[]);assert.ok(reopened.manager.sceneGroup.children.some(m=>m.geometry.attributes.fkUV));assert.ok(!reopened.requests.some(r=>r.command==='render'));
+});
+
+test('an uncommitted streaming stroke closes its native painter on cancellation',async()=>{
+ const f=fixture(new Map(),null,null,{nativeStreaming:true});f.manager.makeCurve('live',f.attributes);await settled();const {mesh}=f.manager.getGeomFromInfo(f.manager.curveIdToGeomInfo.get('live'));mesh.geometry.setDrawRange(0,6);f.fk.setBindings({RECT:'rect'});
+ await f.fk.preview(mesh,{...f.attributes,sourceTemplate:true});assert.equal(f.streams.size,1);mesh.geometry.setDrawRange(0,0);f.fk.preview(mesh,{});await settled();assert.equal(f.streams.size,0);assert.ok(f.requests.some(r=>r.previewEnd));assert.deepEqual(f.errors,[]);
+});
+
+test('a growing 6000-sample gesture never resubmits earlier native samples or expands a batch',async()=>{
+ const f=fixture(new Map(),null,null,{nativeStreaming:true,quietStreaming:true});const points=Array.from({length:6000},(_,i)=>({x:Math.cos(i*.02),y:Math.sin(i*.02),z:0}));
+ const a={...f.attributes,points,normals:points.map(()=>({x:0,y:0,z:1})),pressures:points.map((_,i)=>.1+.9*(i%100)/99)};
+ f.manager.makeCurve('live',a);await settled();const {mesh}=f.manager.getGeomFromInfo(f.manager.curveIdToGeomInfo.get('live'));mesh.geometry.setDrawRange(0,6);f.fk.setBindings({RECT:'rect'});
+ for(const count of [200,500,1000,2000,4000,6000])await f.fk.preview(mesh,{...a,points:points.slice(0,count),normals:a.normals.slice(0,count),pressures:a.pressures.slice(0,count),sourceTemplate:true});
+ const calls=f.requests.filter(r=>r.streamFrom!==undefined),samples=calls.flatMap(r=>r.points);
+ assert.equal(samples.length,5997);assert.equal(calls.filter(r=>r.streamBegin).length,1);assert.ok(calls.every(r=>r.points.length<=64));
+ assert.deepEqual(samples.map(p=>p[3]),samples.map((_,i)=>i*8));assert.deepEqual(samples.map(p=>p[2]),a.pressures.slice(0,5997));assert.deepEqual(f.errors,[]);
+ mesh.geometry.setDrawRange(0,0);f.fk.preview(mesh,{});await settled();assert.equal(f.streams.size,0);
 });

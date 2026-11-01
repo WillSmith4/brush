@@ -10,6 +10,7 @@ static NSString *const FKPresetBindingsKey = @"FeatherKrita.presetBindings.v1";
 static char FKControllerKey;
 static char FKRouterKey;
 static char FKServedTaskKey;
+static char FKStoppedTaskKey;
 static void *FKLibrary;
 static dispatch_queue_t FKStorageQueue(void) {
     static dispatch_queue_t queue;
@@ -355,6 +356,31 @@ static id FKWebViewInit(id object, SEL selector, CGRect frame, WKWebViewConfigur
 static IMP originalSchemeStart, originalSchemeStop;
 static void FKSchemeStart(id self, SEL selector, WKWebView *view, id<WKURLSchemeTask> task) {
     NSURL *url = task.request.URL;
+    if ([url.scheme isEqualToString:@"local"] && [url.host isEqualToString:@"app"] &&
+        [url.path hasPrefix:@"/feather-krita-preview/"]) {
+        objc_setAssociatedObject(task, &FKServedTaskKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        NSString *token = url.lastPathComponent;
+        NSUUID *uuid = [token.pathExtension isEqualToString:@"rgba"] ? [[NSUUID alloc] initWithUUIDString:token.stringByDeletingPathExtension] : nil;
+        if (!uuid || ![url.path isEqualToString:[@"/feather-krita-preview/" stringByAppendingString:token]]) {
+            [task didFailWithError:[NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorBadURL userInfo:nil]]; return;
+        }
+        NSString *path = [[FKDirectory() stringByAppendingPathComponent:@"Resources/PreviewPixels"] stringByAppendingPathComponent:token];
+        dispatch_async(FKStorageQueue(), ^{
+            NSError *error = nil;
+            NSDictionary *attrs = [NSFileManager.defaultManager attributesOfItemAtPath:path error:&error];
+            NSData *data = nil;
+            if (attrs && [attrs fileSize] <= 10485760 && [attrs[NSFileType] isEqualToString:NSFileTypeRegular])
+                data = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:&error];
+            if (data) [NSFileManager.defaultManager removeItemAtPath:path error:nil];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (objc_getAssociatedObject(task, &FKStoppedTaskKey)) return;
+                if (!data) { [task didFailWithError:error ?: [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorCannotOpenFile userInfo:nil]]; return; }
+                NSURLResponse *response = [[NSHTTPURLResponse alloc] initWithURL:url statusCode:200 HTTPVersion:@"HTTP/1.1" headerFields:@{@"Content-Type": @"application/octet-stream", @"Content-Length": [NSString stringWithFormat:@"%lu", (unsigned long)data.length], @"Cache-Control": @"no-store"}];
+                [task didReceiveResponse:response]; [task didReceiveData:data]; [task didFinish];
+            });
+        });
+        return;
+    }
     // Match the verified 1.3.4 resource exactly, including when its original
     // copy is already cached in the application's data container.
     if ([url.scheme isEqualToString:@"local"] && [url.host isEqualToString:@"app"] &&
@@ -370,7 +396,7 @@ static void FKSchemeStart(id self, SEL selector, WKWebView *view, id<WKURLScheme
     ((void (*)(id, SEL, WKWebView *, id<WKURLSchemeTask>))originalSchemeStart)(self, selector, view, task);
 }
 static void FKSchemeStop(id self, SEL selector, WKWebView *view, id<WKURLSchemeTask> task) {
-    if (objc_getAssociatedObject(task, &FKServedTaskKey)) return;
+    if (objc_getAssociatedObject(task, &FKServedTaskKey)) { objc_setAssociatedObject(task, &FKStoppedTaskKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC); return; }
     ((void (*)(id, SEL, WKWebView *, id<WKURLSchemeTask>))originalSchemeStop)(self, selector, view, task);
 }
 static void FKInstallMethods(void) {

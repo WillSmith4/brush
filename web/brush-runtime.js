@@ -20,6 +20,8 @@
   let renderTail = Promise.resolve(), textureBytes = 0;
   let nextPreviewSession=0, previewReadyAt=0;
   const inputPreviews=new WeakMap();
+  const liveRecords=new WeakMap();
+  function sameHostPath(a,b){return a.size===b.size&&a.shape===b.shape&&a.points?.length===b.points?.length&&a.points.every((p,i)=>xyz(p).every((v,k)=>v===xyz(b.points[i])[k]));}
   const MAX_TEXTURE_BYTES = 64 * 1024 * 1024;
   const post = body => root.webkit.messageHandlers.FeatherKrita.postMessage(body);
   const clone = value => JSON.parse(JSON.stringify(value));
@@ -121,8 +123,8 @@
 
   // Merge occupied pixel runs, retaining holes and irregular brush-tip edges.
   // Fragment coverage still clips exact pixels if a noisy mask needs coarser cells.
-  function* coverageRuns(rgba,width,height,minimumStep=1) {
-    if(rgba.length!==width*height*4)throw new Error("Invalid brush coverage dimensions.");
+  function* coverageRuns(rgba,width,height,minimumStep=1,stride=4) {
+    if(rgba.length!==width*height*stride)throw new Error("Invalid brush coverage dimensions.");
     for(let step=minimumStep;step<=16;step*=2){
       const rectangles=[],open=new Map();
       for(let y=0;y<height;y+=step){
@@ -130,7 +132,7 @@
         const runs=[];let start=-1;
         for(let x=0;x<=width;x+=step){
           let occupied=false;
-          if(x<width)for(let yy=y;yy<Math.min(y+step,height)&&!occupied;yy++)for(let xx=x;xx<Math.min(x+step,width);xx++)if(rgba[(yy*width+xx)*4+3]){occupied=true;break;}
+          if(x<width)for(let yy=y;yy<Math.min(y+step,height)&&!occupied;yy++)for(let xx=x;xx<Math.min(x+step,width);xx++)if(rgba[(yy*width+xx)*stride+stride-1]){occupied=true;break;}
           if(occupied&&start<0)start=x;
           if(!occupied&&start>=0){runs.push([start,Math.min(x,width)]);start=-1;}
           if(x+step>width&&start>=0){runs.push([start,width]);start=-1;}
@@ -148,8 +150,8 @@
     const rows=coverageRuns(rgba,width,height,minimumStep);let row;
     do{row=rows.next();}while(!row.done);return row.value;
   }
-  async function previewCoverage(rgba,width,height,budget){
-    const rows=coverageRuns(rgba,width,height,8);let row;
+  async function previewCoverage(rgba,width,height,budget,stride=4){
+    const rows=coverageRuns(rgba,width,height,8,stride);let row;
     do{const pause=budget.check();if(pause)await pause;row=rows.next();}while(!row.done);return row.value;
   }
   const segmentTrees=new WeakMap();
@@ -302,6 +304,8 @@
     const preset=(gesture?.bindings || bindings)[attributes.shape];
     if(!preset){artworks.set(id,Promise.resolve(null));return;}
     const record={version:2,preset,paintOrder:newPaintOrder(id),attributes:clone(attributes)};
+    const stream=gesture?.streams?.find(s=>!s.claimed&&s.preset===preset&&s.basis&&Math.hypot(...sub(xyz(attributes.points[0]),s.basis.origin))<Math.max(attributes.size*.1,.0001));
+    if(stream){stream.claimed=true;stream.finishAttributes=clone(attributes);liveRecords.set(record,stream);}
     artworks.set(id,Promise.resolve(record));save(id,record).catch(fail);
   }
   function artwork(id) {
@@ -408,6 +412,111 @@
     }
   }
   const rendering=new WeakMap();
+  function nativeSerial(body){const job=renderTail.then(()=>checked(body));renderTail=job.catch(()=>{});return job;}
+  function streamFrame(s,x,y,width,height,scaleFactor=1,points=s.worldPoints,normals=s.worldNormals){
+    const scale=s.basis.scale*scaleFactor,minX=(x-8192)/s.basis.scale,maxY=(8192-y)/s.basis.scale;
+    return {...s.basis,scale,width,height,minX,maxX:minX+width/scale,maxY,minY:maxY-height/scale,points,normals,projected:points.map(p=>{const d=sub(p,s.basis.origin);return [dot(d,s.basis.u),dot(d,s.basis.v)];})};
+  }
+  async function streamBackground(s,points){
+    if(!s.meta.samplesBackdrop)return [];
+    const tiles=[],margin=Math.max(128*3,128*(s.meta.extent||1));
+    for(const p of points)for(let y=Math.max(0,Math.floor((p[1]-margin)/256)*256);y<=Math.min(16128,p[1]+margin);y+=256)for(let x=Math.max(0,Math.floor((p[0]-margin)/256)*256);x<=Math.min(16128,p[0]+margin);x+=256){
+      const key=x+':'+y;if(s.backdrops.has(key))continue;
+      const frame=streamFrame(s,x-1,y-1,258,258),captured=snapshot(frame),picture=new Image();picture.src='data:image/png;base64,'+captured.png;await picture.decode();
+      const canvas=document.createElement('canvas');canvas.width=canvas.height=256;const ctx=canvas.getContext('2d');ctx.drawImage(picture,1,1,256,256,0,0,256,256);
+      tiles.push({x,y,png:canvas.toDataURL('image/png').split(',')[1]});s.backdrops.set(key,{encoding:'linear-camera-v3',depth:captured.depth,near:captured.near,far:captured.far,distance:captured.distance});
+      if(tiles.length>=64)throw new Error('The blend update covers too many surface tiles.');
+    }return tiles;
+  }
+  async function showStreamTiles(s,result,active){
+    if(!result.tiles?.length||!active())return;
+    const response=await root.fetch('/feather-krita-preview/'+result.pixels,{cache:'no-store'});if(!response.ok)throw new Error('Cannot load live brush tiles.');
+    const bytes=new Uint8Array(await response.arrayBuffer()),state=states.get(s.holder.manager);
+    for(const tile of result.tiles){
+      if(!active())return;
+      const key=(tile.x+1)+':'+(tile.y+1),id='tile:'+key,size=tile.width*tile.height*5;
+      if(!Number.isInteger(tile.offset)||tile.offset<0||tile.offset+size>bytes.length)throw new Error('Invalid live tile packet.');
+      const selected=[];
+      const tx=Math.floor((tile.x+1)/256),ty=Math.floor((tile.y+1)/256);
+      for(let y=ty-2;y<=ty+2;y++)for(let x=tx-2;x<=tx+2;x++)for(const i of s.pointCells.get(x+':'+y)||[])selected.push(i);
+      selected.sort((a,b)=>a-b);
+      if(!selected.length)selected.push(Math.max(0,s.worldPoints.length-1));
+      const points=selected.map(i=>s.worldPoints[i]),normals=selected.map(i=>s.worldNormals[i]);if(points.length===1){points.push(points[0]);normals.push(normals[0]);}
+      const a={...s.attributes,points,normals,pressures:[]},frame=streamFrame(s,tile.x,tile.y,tile.width,tile.height,1,points,normals);
+      const record={version:2,preview:true,preset:s.preset,attributes:a,frame,surface:s.backdrops.get(key),streamClip:true,result:{...tile,pixels:result.pixels,pixelBytes:bytes.subarray(tile.offset,tile.offset+size),composited:result.composited}};
+      if(!record.surface)record.guideSurface=guideSurface(frame,a);
+      const entry=await loadAssets(record,active);if(!active()){releasePreviewAsset(entry);return;}
+      const previous=state.records.get(id);
+      // On a fixed Guide, geometry and UVs are independent of how much ink has
+      // accumulated. Update its two small textures, not the surface mesh.
+      if(previous?.streamGuide&&record.guideSurface){
+        entry.refs++;const old=previous.entry;previous.entry=entry;
+        previous.mesh.material.uniforms.fkBrush.value=entry.texture;previous.mesh.material.uniforms.fkCoverage.value=entry.mask;
+        old.refs--;releasePreviewAsset(old);api.redraw?.();continue;
+      }
+      const info={attributes:a,numOfPoints:1,geomAttributes:0,geomIndex:0,fkIndexCount:6};s.holder.manager.curveIdToGeomInfo.set(id,info);
+      await replaceCurve(s.holder.manager,state,id,info,record,entry,a,active);
+      if(state.records.has(id))state.records.get(id).streamGuide=!!record.guideSurface;
+      const mesh=state.records.get(id)?.mesh;if(mesh){mesh.material.uniforms.fkTileClip={value:[1/258,1/258,257/258,257/258]};if(!mesh.material.userData.fkTileClip){mesh.material.fragmentShader='uniform vec4 fkTileClip;\n'+mesh.material.fragmentShader.replace('vec4 fkSample =','if(any(lessThan(fkTexCoord,fkTileClip.xy))||any(greaterThanEqual(fkTexCoord,fkTileClip.zw))) discard;\nvec4 fkSample =');mesh.material.userData.fkTileClip=true;mesh.material.needsUpdate=true;}}
+    }
+  }
+  async function streamedResult(s,result){
+    const output={result,frame:streamFrame(s,result.streamX,result.streamY,result.width,result.height,result.streamScale),attributes:{...s.attributes,points:s.worldPoints,normals:s.worldNormals,pressures:[]}};
+    if(s.meta.samplesBackdrop&&s.backdrops.size){
+      const canvas=document.createElement('canvas');canvas.width=result.width;canvas.height=result.height;const ctx=canvas.getContext('2d');ctx.imageSmoothingEnabled=false;
+      let first;
+      for(const [key,surface]of s.backdrops){first??=surface;const [x,y]=key.split(':').map(Number),image=new Image();image.src='data:image/png;base64,'+surface.depth;await image.decode();ctx.drawImage(image,1,1,256,256,(x-result.streamX)*result.streamScale,(y-result.streamY)*result.streamScale,256*result.streamScale,256*result.streamScale);}
+      output.surface={...first,depth:canvas.toDataURL('image/png').split(',')[1]};
+    }return output;
+  }
+  async function appendStream(s,attributes,finish,active=()=>true){
+    const points=attributes.points.map(xyz),normals=attributes.normals||[],pressure=attributes.pressures||[];
+    if(!s.basis){
+      const first=strokeRequest(attributes,s.preset,api.fallbackSize,s.meta,cameraRight()).frame;
+      let u=first.u,v=first.v,normal=first.normal;
+      // Freeze the camera-facing working plane for the gesture. It covers the
+      // visible hemisphere of a round Guide even when surface normals turn.
+      try{const m=api.camera().matrixWorld.elements;u=unit(m.slice(0,3));v=unit(m.slice(4,7));normal=unit(m.slice(8,11));}catch{}
+      s.basis={origin:first.origin,u,v,normal,scale:128/first.size,size:first.size};s.attributes={...attributes};s.attributes.points=[];s.attributes.normals=[];
+    }
+    // A Catmull-Rom segment becomes stable once its next control point exists.
+    // Keep the mutable trailing segment until more input (or Pencil-up) arrives.
+    const end=finish?points.length:Math.max(1,points.length-3);
+    while(s.sent<end){
+      const stop=Math.min(end,s.sent+64),batch=[];
+      for(let i=s.sent;i<stop;i++){
+        const d=sub(points[i],s.basis.origin),p=[8192+dot(d,s.basis.u)*s.basis.scale,8192-dot(d,s.basis.v)*s.basis.scale,pressure.length?pressure[Math.min(i,pressure.length-1)]:1,i*8];
+        batch.push(p);s.worldPoints.push(points[i]);s.worldNormals.push(xyz(normalAt(normals,i,points.length)));s.nativePoints.push(p);
+        const key=Math.floor(p[0]/256)+':'+Math.floor(p[1]/256),cell=s.pointCells.get(key)||[];
+        // Geometry needs the local surface, not every repeated paint sample.
+        // Preserve native samples separately; bound only this spatial lookup.
+        cell.push(s.worldPoints.length-1);if(cell.length>256)cell.splice(1,1);s.pointCells.set(key,cell);
+      }
+      const body={command:'render',preset:s.preset,previewSession:s.id,streamFrom:s.sent,points:batch,streamTiles:await streamBackground(s,batch)};
+      if(!s.started)Object.assign(body,{streamBegin:true,width:16384,height:16384,size:128,color:s.attributes.color.slice(0,3),opacity:s.attributes.color[3]??1,seed:1,streamBackdrop:!!s.meta.samplesBackdrop});
+      if(finish&&stop===end)body.streamFinish=true;
+      const result=await nativeSerial(body);s.started=true;s.sent=result.streamCount;
+      if(body.streamFinish){s.ended=true;return streamedResult(s,result);}
+      if(!finish)await showStreamTiles(s,result,active);
+      while(result.pendingTiles&&!finish&&active()){
+        const drained=await nativeSerial({command:'render',preset:s.preset,previewSession:s.id,streamFrom:s.sent,points:[]});await showStreamTiles(s,drained,active);result.pendingTiles=drained.pendingTiles;
+      }
+      if(!finish&&!active())return;
+    }
+    if(finish){
+      const result=await nativeSerial({command:'render',preset:s.preset,previewSession:s.id,streamFrom:s.sent,points:[],streamFinish:true});s.ended=true;
+      return streamedResult(s,result);
+    }
+  }
+  function finishStream(s,attributes){
+    if(!s.final)s.final=s.tail.then(()=>appendStream(s,s.finishAttributes?.points.length>=s.sent?s.finishAttributes:s.latest||attributes,true));return s.final;
+  }
+  async function liveStroke(holder,attributes,preset,meta,active){
+    let s=holder.stream;
+    if(!s){s={holder,preset,meta:{...meta,samplesBackdrop:meta.samplesBackdrop||meta.engine==='mypaintbrush'},id:'stroke-'+Date.now()+'-'+(++nextPreviewSession),sent:0,started:false,ended:false,worldPoints:[],worldNormals:[],nativePoints:[],pointCells:new Map(),backdrops:new Map(),tail:Promise.resolve()};holder.stream=s;(gesture.streams??=[]).push(s);}
+    s.latest=clone(attributes);delete s.latest.sourceTemplate;
+    const job=s.tail.then(()=>appendStream(s,s.latest,false,active));s.tail=job.catch(()=>{});await job;
+  }
   function closePreview(cache){
     if(!cache.session||!cache.sessionOpened)return;
     const body={command:"render",preset:cache.preset,previewSession:cache.session,previewEnd:true};cache.sessionOpened=false;
@@ -415,6 +524,9 @@
   }
   async function renderRecord(id,record,active=()=>true,previewCache=null) {
     if(record.result)return record;
+    if(liveRecords.has(record)){
+      const s=liveRecords.get(record),finished=await finishStream(s,record.attributes);record.hostAttributes=record.attributes;Object.assign(record,finished);if(id)await save(id,record);liveRecords.delete(record);return record;
+    }
     if(rendering.has(record))return rendering.get(record);
     const job=renderTail.then(async()=>{
       if(!active())return null;
@@ -437,7 +549,8 @@
         const captured=snapshot(request.frame);request.body.backdrop=captured.png;record.surface={encoding:"linear-camera-v3",depth:captured.depth,near:captured.near,far:captured.far,distance:captured.distance};
       }
       const signature=previewCache?JSON.stringify(request.body):null;
-      if(record.preview&&meta.previewSessions&&previewCache){
+      if(record.preview&&meta.previewPixels&&typeof root.fetch==="function")request.body.previewPixels=true;
+      else if(record.preview&&meta.previewSessions&&previewCache){
         if(!previewCache.session)previewCache.session='preview-'+Date.now()+'-'+(++nextPreviewSession);
         request.body.previewSession=previewCache.session;previewCache.preset=record.preset;previewCache.sessionOpened=true;
       }
@@ -454,11 +567,41 @@
     try{return await job;}finally{rendering.delete(record);}
   }
   function evict(){for(const [record,entry] of assets){if(textureBytes<=MAX_TEXTURE_BYTES)break;if(entry.refs||!entry.texture)continue;entry.texture.dispose();entry.mask.dispose();textureBytes-=entry.bytes;assets.delete(record);}}
+  async function rawPreviewAssets(record,entry,active){
+    const r=record.result,w=r.width,h=r.height,n=w*h,budget=workBudget(true,active);
+    if(!Number.isInteger(w)||!Number.isInteger(h)||w<1||h<1||w>4096||h>4096||n>2097152||!/^[-a-fA-F0-9]{36}\.rgba$/.test(r.pixels))throw new Error("Invalid live pixel response.");
+    if(!r.pixelBytes){
+      const response=await root.fetch('/feather-krita-preview/'+r.pixels,{cache:'no-store'});
+      if(!response.ok)throw new Error("Cannot load the live brush pixels.");
+      r.pixelBytes=new Uint8Array(await response.arrayBuffer());
+    }
+    if(r.pixelBytes.length!==n*5)throw new Error("Invalid live pixel dimensions.");
+    const coverage=r.pixelBytes.subarray(n*4),rgba=new Uint8Array(n*4),mask=new Uint8Array(n);
+    for(let y=0;y<h;y++){
+      if(y%32===0){const pause=budget.check();if(pause)await pause;}
+      rgba.set(r.pixelBytes.subarray(y*w*4,(y+1)*w*4),(h-1-y)*w*4);
+      mask.set(coverage.subarray(y*w,(y+1)*w),(h-1-y)*w);
+    }
+    entry.rectangles=record.guideSurface&&!record.surface?.depth?[[0,0,w,h]]:await previewCoverage(coverage,w,h,budget,1);
+    if(record.surface?.encoding==="linear-camera-v3"){
+      const depth=new Image();depth.src="data:image/png;base64,"+record.surface.depth;await depth.decode();
+      if(depth.width!==w||depth.height!==h)throw new Error("Invalid live depth dimensions.");
+      const c=document.createElement('canvas');c.width=w;c.height=h;const ctx=c.getContext('2d',{willReadFrequently:true});ctx.drawImage(depth,0,0);entry.depth=ctx.getImageData(0,0,w,h).data;
+    }
+    // The app does not export its DataTexture class. These are the exact
+    // DataTexture fields used by its bundled Three.js WebGLTextures upload path.
+    for(const [key,data,format]of [['texture',rgba,1023],['mask',mask,1028]]){
+      const texture=new api.Texture();texture.isDataTexture=true;texture.image={data,width:w,height:h};texture.format=format;texture.type=1009;
+      texture.flipY=false;texture.unpackAlignment=1;texture.generateMipmaps=false;texture.minFilter=api.LinearFilter;texture.magFilter=api.LinearFilter;texture.needsUpdate=true;entry[key]=texture;
+    }
+    entry.rawCoverage=true;entry.bytes=n*5;textureBytes+=entry.bytes;return entry;
+  }
   async function loadAssets(record,active=()=>true) {
     if(assets.has(record))return assets.get(record).promise;
     const entry={refs:0,preview:!!record.preview,record};assets.set(record,entry);
     entry.promise=(async()=>{
       const result=record.result;
+      if(record.preview&&result.pixels)return rawPreviewAssets(record,entry,active);
       const image=new Image(),maskImage=new Image();
       image.src="data:image/png;base64,"+result.png;maskImage.src="data:image/png;base64,"+result.coverage;
       await Promise.all([image.decode(),maskImage.decode()]);
@@ -536,6 +679,7 @@
       "fkSample.rgb = clamp(fkSample.rgb + vColor.rgb - fkBaseColor.rgb, 0.0, 1.0);\n"+
       "fkSample.a *= fkBaseColor.a > 0.0001 ? vColor.a / fkBaseColor.a : 0.0;\n"+
       "vec4 diffuseColor = fkSample;");
+    if(entry.rawCoverage)material.fragmentShader=material.fragmentShader.replace("texture2D(fkCoverage, fkTexCoord).a","texture2D(fkCoverage, fkTexCoord).r");
     // Feather writes gl_FragDepth explicitly, so fixed-function polygonOffset
     // cannot reliably separate paint from its drawing surface. Apply a small
     // world-space bias in the same linear depth convention as the host.
@@ -723,18 +867,20 @@
       const previous=state.records.get(id),pending=state.pending.get(id),dirty=state.dirty.has(id);
       if(previous?.info===info&&!dirty){hideCurve(manager,info,state,id);previous.syncVisibility();continue;}
       if(pending?.info===info&&!dirty){if(previous||pending.masked)hideCurve(manager,info,state,id);continue;}
-      const attributes=latestAttributes.get(info)||info.attributes,token={info};state.pending.set(id,token);
+      let attributes=latestAttributes.get(info)||info.attributes;const token={info};state.pending.set(id,token);
       const generation=state.generation;
       const active=()=>generation===state.generation&&state.pending.get(id)===token&&manager.curveIdToGeomInfo.get(id)===info;
       const saved=info.fkRecord?Promise.resolve(info.fkRecord):artwork(id);
       saved.then(async record=>{
         if(!record||!active())return;
+        if(record.hostAttributes&&sameHostPath(attributes,record.hostAttributes))attributes={...record.attributes,color:attributes.color,materialStyle:attributes.materialStyle};
         hideCurve(manager,info,state,id);
         token.masked=true;
         const restore=async()=>{const entry=await loadAssets(record);if(active())await replaceCurve(manager,state,id,info,record,entry,attributes,active);};
         if(record.result){const ready=restore();restoringSurfaces.add(ready);try{await ready;}finally{restoringSurfaces.delete(ready);}return;}
         const rendered=await renderRecord(info.fkRecord?null:id,record,info.fkRecord?active:()=>true);
         if(!rendered||!active())return;
+        if(record.hostAttributes&&sameHostPath(attributes,record.hostAttributes))attributes={...record.attributes,color:attributes.color,materialStyle:attributes.materialStyle};
         const ready=restore();restoringSurfaces.add(ready);try{await ready;}finally{restoringSurfaces.delete(ready);}
       }).catch(error=>{
         if(active()){const h=state.hidden.get(id);if(h){h.mask.array.fill(0,h.offset,h.offset+h.count);h.mask.needsUpdate=true;state.hidden.delete(id);}}
@@ -914,7 +1060,7 @@
     let holder=previews.get(mesh);
     const stop=!mesh.geometry.drawRange.count||!attributes.shape;
     if(stop){
-      if(holder){holder.epoch++;clearTimeout(holder.timer);holder.timer=null;holder.latest=null;holder.signature=null;closePreview(holder.cache);holder.cache={};clearState(states.get(holder.manager));holder.manager.curveIdToGeomInfo.clear();}
+      if(holder){holder.epoch++;clearTimeout(holder.timer);holder.timer=null;holder.latest=null;holder.signature=null;closePreview(holder.cache);holder.cache={};const s=holder.stream;holder.stream=null;if(s&&!s.claimed)s.tail.then(()=>s.started&&!s.ended?nativeSerial({command:'render',preset:s.preset,previewSession:s.id,previewEnd:true}):null).catch(fail);clearState(states.get(holder.manager));holder.manager.curveIdToGeomInfo.clear();}
       gesture=null;return;
     }
     if(!gesture)gesture={bindings:{...bindings}};
@@ -938,6 +1084,8 @@
       const latest=holder.latest;holder.latest=null;holder.running=true;
       const epoch=holder.epoch,active=()=>!holder.disposed&&epoch===holder.epoch&&!!mesh.parent;
       try{
+        const meta=await presetInfo(latest.preset);if(!active())return;
+        if(meta.strokeStreaming===1&&typeof root.fetch==='function'){await liveStroke(holder,latest.attributes,latest.preset,meta,active);return;}
         const signature=JSON.stringify([latest.preset,latest.attributes,cameraRight()]);
         if(signature===holder.signature)return;
         const a=clone(latest.attributes);
