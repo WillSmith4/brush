@@ -237,6 +237,7 @@ struct RenderJob {
 // serialized on the engine queue; the WebKit thread never enqueues thousands of
 // paint jobs or waits for the image scheduler to finish.
 QMap<QString, std::shared_ptr<RenderJob>> previewSessions;
+QMap<QString, bool> verifiedSessionPresets;
 bool renderBusy = false;
 dispatch_queue_t renderQueue() {
     static dispatch_queue_t queue = dispatch_queue_create("FeatherKrita.native-render", DISPATCH_QUEUE_SERIAL);
@@ -348,9 +349,12 @@ QImage captureLive(RenderJob &job) {
     // waitForDone() cannot be used with an open stroke. A barrier runs after the
     // paintop's inserted asynchronous/masking updates, while preserving its
     // spacing, random source and smudge state for the next appended points.
-    std::mutex mutex; std::condition_variable ready; bool done = false;
-    QImage output; std::exception_ptr failure;
-    job.image->addJob(job.stroke, new KisRunnableStrokeJobData([&] {
+    struct Capture {
+        std::mutex mutex; std::condition_variable ready; bool done = false;
+        QImage output; std::exception_ptr failure;
+    };
+    auto capture = std::make_shared<Capture>();
+    job.image->addJob(job.stroke, new KisRunnableStrokeJobData([capture, &job] {
         try {
             KisPaintDeviceSP copy = new KisPaintDevice(*job.layer->paintDevice());
             if (job.layer->hasTemporaryTarget()) {
@@ -358,13 +362,13 @@ QImage captureLive(RenderJob &job) {
                 KisPainter painter(copy); job.layer->setupTemporaryPainter(&painter);
                 painter.bitBlt(QPoint(0, 0), job.layer->temporaryTarget(), QRect(0, 0, job.width, job.height));
             }
-            output = copy->convertToQImage(nullptr, 0, 0, job.width, job.height).convertToFormat(QImage::Format_ARGB32);
-        } catch (...) { failure = std::current_exception(); }
-        { std::lock_guard<std::mutex> lock(mutex); done = true; } ready.notify_one();
+            capture->output = copy->convertToQImage(nullptr, 0, 0, job.width, job.height).convertToFormat(QImage::Format_ARGB32);
+        } catch (...) { capture->failure = std::current_exception(); }
+        { std::lock_guard<std::mutex> lock(capture->mutex); capture->done = true; } capture->ready.notify_one();
     }, KisStrokeJobData::BARRIER));
-    std::unique_lock<std::mutex> lock(mutex); ready.wait(lock, [&] { return done; });
-    if (failure) std::rethrow_exception(failure);
-    return output;
+    std::unique_lock<std::mutex> lock(capture->mutex); capture->ready.wait(lock, [&] { return capture->done; });
+    if (capture->failure) std::rethrow_exception(capture->failure);
+    return capture->output;
 }
 
 QJsonObject finishRender(RenderJob &job, bool live = false) {
@@ -428,9 +432,12 @@ extern "C" void FKFreeResponse(char *response) { std::free(response); }
 extern "C" void FKRenderAsync(const char *json, FKRenderCompletion completion, void *context) {
     struct Pending {
         std::shared_ptr<RenderJob> job;
+        std::shared_ptr<RenderJob> reference;
         std::vector<std::shared_ptr<RenderJob>> retired;
         QString session;
         bool live = false, close = false, failed = false;
+        bool verified = false;
+        QString preset;
         int appended = 0;
         FKRenderCompletion completion;
         void *context;
@@ -449,11 +456,13 @@ extern "C" void FKRenderAsync(const char *json, FKRenderCompletion completion, v
         pending->session = request["previewSession"].toString();
         require(pending->session.size() <= 128, "Invalid live stroke identifier.");
         pending->live = !pending->session.isEmpty(); pending->close = request["previewEnd"].toBool();
+        pending->preset = request["preset"].toString();
         require(!pending->close || pending->live, "Missing live stroke identifier.");
         auto previous = previewSessions.value(pending->session);
         if (pending->close) {
             if (previous) { pending->retired.push_back(previous); previewSessions.remove(pending->session); }
         } else {
+            if (verifiedSessionPresets.contains(pending->preset) && !verifiedSessionPresets[pending->preset]) pending->live = false;
             const int count = request["points"].toArray().size();
             require(count > 0 && count <= 10000, "Invalid stroke input.");
             if (pending->live && previous && canAppend(*previous, request)) {
@@ -465,6 +474,11 @@ extern "C" void FKRenderAsync(const char *json, FKRenderCompletion completion, v
                 if (previous) { pending->retired.push_back(previous); previewSessions.remove(pending->session); }
             }
             if (pending->live) {
+                // Compare the first open-stroke snapshot against the unchanged
+                // finished renderer on the real device/preset. Engines whose
+                // finish callback changes the image retain the full-render
+                // path; they still benefit from input coalescing and off-UI work.
+                if (!verifiedSessionPresets.contains(pending->preset)) pending->reference = prepareRender(request);
                 while (!previewSessions.contains(pending->session) && previewSessions.size() >= 4) {
                     auto old = previewSessions.begin(); pending->retired.push_back(old.value()); previewSessions.erase(old);
                 }
@@ -479,6 +493,11 @@ extern "C" void FKRenderAsync(const char *json, FKRenderCompletion completion, v
             try {
                 for (auto &old : pending->retired) closeRender(*old);
                 response = pending->close ? QJsonObject{{"closed", true}} : finishRender(*pending->job, pending->live);
+                if (pending->reference) {
+                    const auto reference = finishRender(*pending->reference);
+                    pending->verified = response["png"] == reference["png"] && response["coverage"] == reference["coverage"];
+                    if (!pending->verified) { closeRender(*pending->job); response = reference; }
+                }
                 response["ok"] = true;
                 if (pending->live && !pending->close) response["appendedPoints"] = pending->appended;
             }
@@ -489,7 +508,12 @@ extern "C" void FKRenderAsync(const char *json, FKRenderCompletion completion, v
             dispatch_async_f(dispatch_get_main_queue(), pending, [](void *raw) {
                 std::unique_ptr<Pending> pending(static_cast<Pending *>(raw));
                 if (pending->failed && previewSessions.value(pending->session) == pending->job) previewSessions.remove(pending->session);
+                if (pending->reference && !pending->failed) {
+                    verifiedSessionPresets.insert(pending->preset, pending->verified);
+                    if (!pending->verified) previewSessions.remove(pending->session);
+                }
                 pending->retired.clear();
+                pending->reference.reset();
                 pending->job.reset();
                 renderBusy = false;
                 pending->completion(pending->bytes.constData(), pending->context);
