@@ -44,6 +44,19 @@
   const unit = (a, fallback=[0,0,1]) => Math.hypot(...a)>1e-9 ? mul(a,1/Math.hypot(...a)) : [...fallback];
   const lerp = (a,b,t) => add(mul(a,1-t),mul(b,t));
   const clamp = (v,lo,hi) => Math.max(lo,Math.min(hi,v));
+  const now = () => root.performance?.now() ?? Date.now();
+  // Yield between bounded batches, including live geometry. Native painting is
+  // already asynchronous; a multi-second JS mesh build must not block Pencil.
+  function workBudget(enabled, active=()=>true) {
+    let deadline=now()+5;
+    return {check(){
+      if(!active())throw new Error("Preview cancelled");
+      if(!enabled||now()<deadline)return null;
+      return new Promise(resolve=>setTimeout(resolve,0)).then(()=>{
+        if(!active())throw new Error("Preview cancelled");deadline=now()+5;
+      });
+    }};
+  }
   function normalAt(normals,index,count){
     if(!normals?.length)return {x:0,y:0,z:1};
     const f=clamp(index/Math.max(1,count-1),0,1)*(normals.length-1),i=Math.floor(f);
@@ -57,17 +70,27 @@
 
   // One isotropic projection, not arc-length UVs wrapped around a host tube.
   // A nonplanar path is lifted back onto its local drawing surface at mesh time.
-  function strokeRequest(attributes, preset, fallbackSize=0.01, meta={}, cameraRight=[1,0,0]) {
-    const points = attributes.points?.map(xyz);
-    if (!points?.length || points.some(p=>p.length!==3 || p.some(v=>!Number.isFinite(v)))) throw new Error("Invalid 3D stroke coordinates.");
+  function* strokeRequestSteps(attributes, preset, fallbackSize=0.01, meta={}, cameraRight=[1,0,0]) {
+    const points=[];
+    if(!attributes.points?.length)throw new Error("Invalid 3D stroke coordinates.");
+    for(let i=0;i<attributes.points.length;i++){
+      if(i%128===0)yield;
+      const p=xyz(attributes.points[i]);
+      if(p.length!==3||p.some(v=>!Number.isFinite(v)))throw new Error("Invalid 3D stroke coordinates.");points.push(p);
+    }
     const size = Number(attributes.size)>0 ? Number(attributes.size) : fallbackSize;
-    const normals = (attributes.normals || []).map(xyz);
-    let normal = unit(normals.reduce((a,p)=>add(a,p),[0,0,0]));
-    if (normals.some(p=>p.some(v=>!Number.isFinite(v)))) throw new Error("Invalid stroke normals.");
+    const normals=[],sum=[0,0,0];
+    for(let i=0;i<(attributes.normals?.length||0);i++){
+      if(i%128===0)yield;const n=xyz(attributes.normals[i]);
+      if(n.some(v=>!Number.isFinite(v)))throw new Error("Invalid stroke normals.");
+      normals.push(n);for(let j=0;j<3;j++)sum[j]+=n[j];
+    }
+    let normal = unit(sum);
     let u = sub(cameraRight,mul(normal,dot(cameraRight,normal)));
     if (Math.hypot(...u)<1e-6) u=cross([0,1,0],normal);
     u=unit(u,[1,0,0]); const v=unit(cross(normal,u));
-    const origin=points[0], projected=points.map(p=>{const d=sub(p,origin);return [dot(d,u),dot(d,v)];});
+    const origin=points[0], projected=[];
+    for(let i=0;i<points.length;i++){if(i%128===0)yield;const d=sub(points[i],origin);projected.push([dot(d,u),dot(d,v)]);}
     const margin=size*Math.max(0.75,(Number(meta.extent)||1)*0.6,meta.samplesBackdrop?3:0);
     let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
     for(const p of projected){minX=Math.min(minX,p[0]);minY=Math.min(minY,p[1]);maxX=Math.max(maxX,p[0]);maxY=Math.max(maxY,p[1]);}
@@ -77,22 +100,31 @@
     const width=Math.max(2,Math.ceil(w*scale)),height=Math.max(2,Math.ceil(h*scale));
     maxX=minX+width/scale;minY=maxY-height/scale;
     const pressures=attributes.pressures || [];
-    const input=projected.map((p,i)=>[(p[0]-minX)*scale,(maxY-p[1])*scale,
-      pressures.length?clamp(Number(pressures[Math.min(i,pressures.length-1)]),0,1):1,i*8]);
-    if(input.some(p=>p.some(v=>!Number.isFinite(v))))throw new Error("Invalid brush pressure.");
+    const input=[];
+    for(let i=0;i<projected.length;i++){
+      if(i%128===0)yield;const p=projected[i],sample=[(p[0]-minX)*scale,(maxY-p[1])*scale,
+        pressures.length?clamp(Number(pressures[Math.min(i,pressures.length-1)]),0,1):1,i*8];
+      if(sample.some(v=>!Number.isFinite(v)))throw new Error("Invalid brush pressure.");input.push(sample);
+    }
     const sampled=input.length<=4096?input:Array.from({length:4096},(_,i)=>input[Math.round(i*(input.length-1)/4095)]);
     const color=attributes.color || [0,0,0,1];
     return {body:{command:"render",preset,width,height,size:size*scale,points:sampled,color:color.slice(0,3),opacity:color[3]??1,seed:1},
       frame:{origin,u,v,normal,minX,minY,maxX,maxY,scale,width,height,points,normals,projected,size}};
   }
+  function strokeRequest(...args){const steps=strokeRequestSteps(...args);let step;do{step=steps.next();}while(!step.done);return step.value;}
+  async function previewRequest(args,active){
+    const steps=strokeRequestSteps(...args),budget=workBudget(true,active);let step;
+    do{const pause=budget.check();if(pause)await pause;step=steps.next();}while(!step.done);return step.value;
+  }
 
   // Merge occupied pixel runs, retaining holes and irregular brush-tip edges.
   // Fragment coverage still clips exact pixels if a noisy mask needs coarser cells.
-  function coverageRectangles(rgba,width,height,minimumStep=1) {
+  function* coverageRuns(rgba,width,height,minimumStep=1) {
     if(rgba.length!==width*height*4)throw new Error("Invalid brush coverage dimensions.");
     for(let step=minimumStep;step<=16;step*=2){
       const rectangles=[],open=new Map();
       for(let y=0;y<height;y+=step){
+        yield;
         const runs=[];let start=-1;
         for(let x=0;x<=width;x+=step){
           let occupied=false;
@@ -109,6 +141,14 @@
       if(rectangles.length<=100000)return rectangles;
     }
     throw new Error("The brush footprint is too complex.");
+  }
+  function coverageRectangles(rgba,width,height,minimumStep=1) {
+    const rows=coverageRuns(rgba,width,height,minimumStep);let row;
+    do{row=rows.next();}while(!row.done);return row.value;
+  }
+  async function previewCoverage(rgba,width,height,budget){
+    const rows=coverageRuns(rgba,width,height,8);let row;
+    do{const pause=budget.check();if(pause)await pause;row=rows.next();}while(!row.done);return row.value;
   }
   const segmentTrees=new WeakMap();
   const guideGeometryCache=new WeakMap(),guideDirty=new WeakSet();
@@ -147,13 +187,17 @@
     }
     return positions.length?{version:1,positions,normals,uv}:null;
   }
-  function guidePaintGeometry(source,info,record,attributes,patch){
+  async function guidePaintGeometry(source,info,record,attributes,patch,budget){
     const geometry=new api.Geometry(),count=patch.positions.length/3,frame=record.frame;
     const current={points:attributes.points.map(xyz),normals:(attributes.normals||[]).map(xyz)},original={points:record.attributes.points.map(xyz),normals:(record.attributes.normals||[]).map(xyz)};
     const unchanged=attributes.size===record.attributes.size&&current.points.length===original.points.length&&current.points.every((p,i)=>p.every((v,j)=>v===original.points[i][j]));
     const positions=new Float32Array(patch.positions),normals=new Float32Array(patch.normals),progress=new Float32Array(count);
+    const uniform=uniformSurfaceAttributes(source,info);
+    if(record.preview&&(!uniform||!unchanged))await prepareSegmentTree(frame,budget);
     for(let i=0;i<count;i++){
-      const x=patch.uv[i*2]*frame.width,y=(1-patch.uv[i*2+1])*frame.height,location=locate(frame,x,y);progress[i]=location.progress;
+      if(i%128===0){const pause=budget.check();if(pause)await pause;}
+      const x=patch.uv[i*2]*frame.width,y=(1-patch.uv[i*2+1])*frame.height;
+      if(!uniform)progress[i]=locate(frame,x,y).progress;
       if(!unchanged){const to=mapPixel(frame,x,y,attributes,current),from=mapPixel(frame,x,y,record.attributes,original);positions.set(add(patch.positions.slice(i*3,i*3+3),sub(to.position,from.position)),i*3);normals.set(to.normal,i*3);}
     }
     for(const [name,attribute]of Object.entries(source.attributes)){
@@ -177,26 +221,56 @@
     const parts=frame.projected.slice(0,-1).map((p,i)=>{const q=frame.projected[i+1];return {i,minX:Math.min(p[0],q[0]),maxX:Math.max(p[0],q[0]),minY:Math.min(p[1],q[1]),maxY:Math.max(p[1],q[1])};});
     function build(list){
       const node={minX:Infinity,minY:Infinity,maxX:-Infinity,maxY:-Infinity};
-      for(const p of list){node.minX=Math.min(node.minX,p.minX);node.minY=Math.min(node.minY,p.minY);node.maxX=Math.max(node.maxX,p.maxX);node.maxY=Math.max(node.maxY,p.maxY);}
+      for(const p of list){if(p.minX<node.minX)node.minX=p.minX;if(p.minY<node.minY)node.minY=p.minY;if(p.maxX>node.maxX)node.maxX=p.maxX;if(p.maxY>node.maxY)node.maxY=p.maxY;}
       if(list.length<=8)node.items=list;else{const axis=node.maxX-node.minX>node.maxY-node.minY?"X":"Y";list.sort((a,b)=>(a['min'+axis]+a['max'+axis])-(b['min'+axis]+b['max'+axis]));const mid=list.length>>1;node.left=build(list.slice(0,mid));node.right=build(list.slice(mid));}return node;
     }
     const tree=build(parts);segmentTrees.set(frame,tree);return tree;
   }
+  async function prepareSegmentTree(frame,budget){
+    if(segmentTrees.has(frame))return;
+    const parts=[];
+    for(let i=0;i+1<frame.projected.length;i++){
+      if(i%256===0){const pause=budget.check();if(pause)await pause;}
+      const a=frame.projected[i],b=frame.projected[i+1];
+      parts.push({i,minX:a[0]<b[0]?a[0]:b[0],maxX:a[0]>b[0]?a[0]:b[0],minY:a[1]<b[1]?a[1]:b[1],maxY:a[1]>b[1]?a[1]:b[1]});
+    }
+    const tree={},pending=[{node:tree,list:parts}];
+    while(pending.length){
+      const pause=budget.check();if(pause)await pause;
+      const {node,list}=pending.pop();node.minX=node.minY=Infinity;node.maxX=node.maxY=-Infinity;
+      for(const p of list){if(p.minX<node.minX)node.minX=p.minX;if(p.minY<node.minY)node.minY=p.minY;if(p.maxX>node.maxX)node.maxX=p.maxX;if(p.maxY>node.maxY)node.maxY=p.maxY;}
+      if(list.length<=8)node.items=list;
+      else{
+        const axis=node.maxX-node.minX>node.maxY-node.minY?"X":"Y";
+        list.sort((a,b)=>(a['min'+axis]+a['max'+axis])-(b['min'+axis]+b['max'+axis]));
+        const mid=list.length>>1;node.left={};node.right={};
+        pending.push({node:node.left,list:list.slice(0,mid)},{node:node.right,list:list.slice(mid)});
+      }
+    }
+    segmentTrees.set(frame,tree);
+  }
   function locate(frame,x,y) {
     const p=[frame.minX+x/frame.scale,frame.maxY-y/frame.scale];
     let best=Infinity,index=0,t=0;
-    const distance=node=>Math.max(node.minX-p[0],0,p[0]-node.maxX)**2+Math.max(node.minY-p[1],0,p[1]-node.maxY)**2;
-    function visit(node){
-      if(distance(node)>best)return;
-      if(!node.items){if(distance(node.left)<distance(node.right)){visit(node.left);visit(node.right);}else{visit(node.right);visit(node.left);}return;}
+    const distance=node=>{
+      const dx=p[0]<node.minX?node.minX-p[0]:p[0]>node.maxX?p[0]-node.maxX:0;
+      const dy=p[1]<node.minY?node.minY-p[1]:p[1]>node.maxY?p[1]-node.maxY:0;
+      return dx*dx+dy*dy;
+    };
+    function visit(node,bound){
+      if(bound>=best)return;
+      if(!node.items){
+        const left=distance(node.left),right=distance(node.right);
+        if(left<right){visit(node.left,left);visit(node.right,right);}else{visit(node.right,right);visit(node.left,left);}return;
+      }
       for(const {i} of node.items){
       const a=frame.projected[i],b=frame.projected[i+1],dx=b[0]-a[0],dy=b[1]-a[1];
-      const f=clamp(((p[0]-a[0])*dx+(p[1]-a[1])*dy)/(dx*dx+dy*dy||1),0,1);
+      const raw=((p[0]-a[0])*dx+(p[1]-a[1])*dy)/(dx*dx+dy*dy||1),f=raw<0?0:raw>1?1:raw;
       const d=(p[0]-a[0]-f*dx)**2+(p[1]-a[1]-f*dy)**2;
       if(d<best){best=d;index=i;t=f;}
       }
     }
-    visit(segmentTree(frame));
+    visit(segmentTree(frame),0);
     return {p,index,t,progress:(index+t)/Math.max(1,frame.points.length-1)};
   }
   function mapPixel(frame,x,y,attributes,prepared) {
@@ -332,7 +406,7 @@
     }
   }
   const rendering=new WeakMap();
-  async function renderRecord(id,record,active=()=>true) {
+  async function renderRecord(id,record,active=()=>true,previewCache=null) {
     if(record.result)return record;
     if(rendering.has(record))return rendering.get(record);
     const job=renderTail.then(async()=>{
@@ -340,7 +414,8 @@
       const meta={...await presetInfo(record.preset)};
       if(meta.engine==="mypaintbrush")meta.samplesBackdrop=true;
       if(!active())return null;
-      const request=strokeRequest(record.attributes,record.preset,api.fallbackSize,meta,cameraRight());
+      const args=[record.attributes,record.preset,api.fallbackSize,meta,cameraRight()];
+      const request=record.preview?await previewRequest(args,active):strokeRequest(...args);
       if(meta.samplesBackdrop){
         // Batch-buffer compaction temporarily removes replacement meshes. Wait
         // for saved paint to return before sampling another brush's substrate.
@@ -348,8 +423,10 @@
         if(!active())return null;
         const captured=snapshot(request.frame);request.body.backdrop=captured.png;record.surface={encoding:"linear-camera-v3",depth:captured.depth,near:captured.near,far:captured.far,distance:captured.distance};
       }
-      const result=await checked(request.body);
+      const signature=previewCache?JSON.stringify(request.body):null;
+      const result=previewCache?.signature===signature?previewCache.result:await checked(request.body);
       if(!active())return null;
+      if(previewCache){previewCache.signature=signature;previewCache.result=result;}
       record.frame=request.frame;record.result=result;
       if(id)save(id,record).catch(fail);
       return record;
@@ -358,18 +435,28 @@
     try{return await job;}finally{rendering.delete(record);}
   }
   function evict(){for(const [record,entry] of assets){if(textureBytes<=MAX_TEXTURE_BYTES)break;if(entry.refs||!entry.texture)continue;entry.texture.dispose();entry.mask.dispose();textureBytes-=entry.bytes;assets.delete(record);}}
-  async function loadAssets(record) {
+  async function loadAssets(record,active=()=>true) {
     if(assets.has(record))return assets.get(record).promise;
-    const entry={refs:0};assets.set(record,entry);
+    const entry={refs:0,preview:!!record.preview,record};assets.set(record,entry);
     entry.promise=(async()=>{
       const result=record.result;
       const image=new Image(),maskImage=new Image();
       image.src="data:image/png;base64,"+result.png;maskImage.src="data:image/png;base64,"+result.coverage;
       await Promise.all([image.decode(),maskImage.decode()]);
       if(image.width!==result.width||image.height!==result.height||maskImage.width!==result.width||maskImage.height!==result.height)throw new Error("Invalid native brush image dimensions.");
-      const canvas=document.createElement("canvas");canvas.width=result.width;canvas.height=result.height;
-      const ctx=canvas.getContext("2d");ctx.drawImage(maskImage,0,0);
-      entry.rectangles=coverageRectangles(ctx.getImageData(0,0,result.width,result.height).data,result.width,result.height,8);
+      const exactSurface=record.preview&&record.guideSurface&&!record.surface?.depth;
+      let canvas,ctx;
+      if(exactSurface){
+        // Guide faces already match the final geometry, independently of mask
+        // occupancy. Planar previews retain the same occupied rectangles as
+        // final paint, including its clipping at the outermost pixel cells.
+        entry.rectangles=[[0,0,result.width,result.height]];
+      }else{
+        canvas=document.createElement("canvas");canvas.width=result.width;canvas.height=result.height;
+        ctx=canvas.getContext("2d",{willReadFrequently:true});ctx.drawImage(maskImage,0,0);
+        const coverage=ctx.getImageData(0,0,result.width,result.height).data;
+        entry.rectangles=record.preview?await previewCoverage(coverage,result.width,result.height,workBudget(true,active)):coverageRectangles(coverage,result.width,result.height,8);
+      }
       // V2 persisted depth with mixed, unrecoverable camera ranges. Preserve
       // its painted pixels but rebuild those surfaces on their original path.
       if(record.surface?.encoding==="linear-camera-v3"){
@@ -407,7 +494,11 @@
   function removeReplacement(state,id){
     const record=state.records.get(id);if(!record)return;
     record.mesh.removeFromParent();record.mesh.geometry.dispose();record.mesh.material.dispose();record.entry.refs--;
-    state.records.delete(id);evict();
+    state.records.delete(id);releasePreviewAsset(record.entry);evict();
+  }
+  function releasePreviewAsset(entry){
+    if(!entry?.preview||entry.refs||!assets.has(entry.record))return;
+    entry.texture?.dispose();entry.mask?.dispose();textureBytes-=entry.bytes||0;assets.delete(entry.record);
   }
   function clearState(state){
     unhideState(state);state.generation++;state.pending.clear();
@@ -458,23 +549,49 @@
     // far-plane pixels. Never let an outlier pull a vertex across the scene.
     return Number.isFinite(height)&&z<0.999999&&Math.abs(height-baseHeight)<=frame.size*2?height:null;
   }
-  async function surfaceGeometry(source,info,record,entry,attributes) {
+  function uniformSurfaceAttributes(source,info) {
+    // Position, normals and colour come from the raster surface. The remaining
+    // Feather attributes (pattern, glow, etc.) are normally constant per stroke.
+    // Check them before bypassing expensive nearest-segment searches.
+    for(const [name,a]of Object.entries(source.attributes)){
+      if(["position","normalUp","normalSide","upDown","color","fkHide"].includes(name))continue;
+      if(a.isInterleavedBufferAttribute)return false;
+      const begin=info.geomAttributes*a.itemSize,end=Math.min(a.array.length,begin+info.numOfPoints*4*a.itemSize);
+      for(let i=begin+a.itemSize;i<end;i++)if(a.array[i]!==a.array[begin+(i-begin)%a.itemSize])return false;
+    }
+    return true;
+  }
+  async function surfaceGeometry(source,info,record,entry,attributes,active=()=>true) {
+    const budget=workBudget(record.preview,active);
     // Match the support's actual triangles instead of joining tangent-plane
     // rectangles by chords that cut through a curved Guide. Persist only this
     // local patch so hiding/deleting the Guide does not reshape finished paint.
     if(!entry.depth){
       if(!record.guideSurface){const patch=guideSurface(record.frame,record.attributes);if(patch){record.guideSurface=patch;guideDirty.add(record);}}
-      if(record.guideSurface)return guidePaintGeometry(source,info,record,attributes,record.guideSurface);
+      if(record.guideSurface)return guidePaintGeometry(source,info,record,attributes,record.guideSurface,budget);
     }
     const {frame}=record,rectangles=[];
+    if(record.preview)await prepareSegmentTree(frame,budget);
     const tile=entry.depth?8:32;
-    for(const [x0,y0,x1,y1] of entry.rectangles)for(let y=y0;y<y1;y+=tile)for(let x=x0;x<x1;x+=tile){const r=[x,y,Math.min(x+tile,x1),Math.min(y+tile,y1)];rectangles.push({r,progress:locate(frame,(r[0]+r[2])/2,(r[1]+r[3])/2).progress});}
+    for(const [x0,y0,x1,y1] of entry.rectangles)for(let y=y0;y<y1;y+=tile)for(let x=x0;x<x1;x+=tile){
+      if(rectangles.length%64===0){const pause=budget.check();if(pause)await pause;}
+      const r=[x,y,Math.min(x+tile,x1),Math.min(y+tile,y1)];rectangles.push({r,progress:locate(frame,(r[0]+r[2])/2,(r[1]+r[3])/2).progress});
+    }
     rectangles.sort((a,b)=>a.progress-b.progress);
     const vertices=[],prepared={points:(attributes.points||[]).map(xyz),normals:(attributes.normals||[]).map(xyz)},originalPrepared={points:(record.attributes.points||[]).map(xyz),normals:(record.attributes.normals||[]).map(xyz)};
+    const mapped=new Map();
+    const pixel=(x,y)=>{
+      const key=y*4097+x;let value=mapped.get(key);
+      if(!value){
+        value=mapPixel(frame,x,y,attributes,prepared);
+        mapped.set(key,value);
+      }return value;
+    };
     let work=0;
     for(const {r:[x0,y0,x1,y1]} of rectangles)for(const [x,y] of [[x0,y0],[x1,y0],[x1,y1],[x0,y1]]){
+      if(work%64===0){const pause=budget.check();if(pause)await pause;}
       if(++work%1024===0&&!record.preview)await new Promise(resolve=>setTimeout(resolve,0));
-      const vertex={x,y,...mapPixel(frame,x,y,attributes,prepared)};
+      const vertex={x,y,...pixel(x,y)};
       if(entry.depth){
         const original=mapPixel(frame,x,y,record.attributes,originalPrepared).position,baseHeight=dot(sub(original,frame.origin),frame.normal);
         const height=surfaceHeight(frame,record.surface,entry.depth,x,y,baseHeight);
@@ -491,14 +608,15 @@
       if(name==="fkHide")continue;
       if(attribute.isInterleavedBufferAttribute)throw new Error("Unsupported interleaved stroke attributes.");
       const array=new attribute.array.constructor(vertices.length*attribute.itemSize);
-      vertices.forEach((vertex,i)=>{
+      for(let i=0;i<vertices.length;i++){
+        if(i%256===0){const pause=budget.check();if(pause)await pause;}const vertex=vertices[i];
         const src=info.geomAttributes+Math.min(info.numOfPoints-1,Math.round(vertex.progress*(info.numOfPoints-1)))*4;
         for(let k=0;k<attribute.itemSize;k++)array[i*attribute.itemSize+k]=attribute.array[src*attribute.itemSize+k];
         if(name==="position")array.set(vertex.position,i*3);
         else if(name==="normalUp"||name==="normalSide")array.set(vertex.normal,i*3);
         else if(name==="upDown")array[i]=0;
         else if(name==="color")array.set([...(attributes.color || [0,0,0]).slice(0,3),Math.round((attributes.color?.[3]??1)*255)],i*4);
-      });
+      }
       geometry.setAttribute(name,new api.Attribute(array,attribute.itemSize,attribute.normalized));
     }
     const uv=new Float32Array(vertices.length*2);vertices.forEach((p,i)=>{uv[i*2]=p.x/frame.width;uv[i*2+1]=1-p.y/frame.height;});
@@ -518,23 +636,49 @@
     });
     geometry.setIndex(new api.Attribute(new Uint32Array(indices),1));geometry.computeBoundingSphere();return geometry;
   }
+  function updatePreviewGeometry(target,next){
+    const attributes={...next.attributes,index:next.index},previous={...target.attributes,index:target.index};
+    const fits=(a,b)=>a&&a.itemSize===b.itemSize&&a.normalized===b.normalized&&a.array.constructor===b.array.constructor&&a.array.length>=b.array.length;
+    // Like Feather's fixed preview buffers: update existing GPU allocations.
+    // Grow only at capacity boundaries, releasing the previous GL buffers first.
+    if(Object.entries(attributes).some(([name,a])=>!fits(previous[name],a))||Object.keys(target.attributes).some(name=>!next.attributes[name]))target.dispose();
+    for(const name of Object.keys(target.attributes))if(!next.attributes[name])target.deleteAttribute(name);
+    for(const [name,a]of Object.entries(attributes)){
+      let current=previous[name];
+      if(!fits(current,a)){
+        const capacity=2**Math.ceil(Math.log2(Math.max(1,a.count)))*a.itemSize;
+        current=new api.Attribute(new a.array.constructor(capacity),a.itemSize,a.normalized);
+        if(name==="index")target.setIndex(current);else target.setAttribute(name,current);
+      }
+      current.array.set(a.array);current.clearUpdateRanges?.();current.addUpdateRange?.(0,a.array.length);current.needsUpdate=true;
+    }
+    target.userData.fkUsedIndices=next.index.count;target.boundingSphere=next.boundingSphere;target.boundingBox=next.boundingBox;
+    next.dispose();return target;
+  }
   async function replaceCurve(manager,state,id,info,record,entry,attributes,active=()=>true) {
     const geom=manager.getGeomFromInfo(info);if(!geom?.geometry?.index)return;
     // Pin textures while yielding between geometry chunks. Another curve can
     // finish and evict unreferenced cache entries during those yields.
     entry.refs++;
     let geometry;
-    try{geometry=await surfaceGeometry(geom.geometry,info,record,entry,attributes);}catch(error){entry.refs--;throw error;}
-    if(!active()){geometry.dispose();entry.refs--;evict();return;}
-    removeReplacement(state,id);
-    const material=materialFor(geom.mesh.material,entry,record.attributes.color || [0,0,0,1],attributes.size);
-    if(record.result.composited){
+    try{geometry=await surfaceGeometry(geom.geometry,info,record,entry,attributes,active);}catch(error){entry.refs--;releasePreviewAsset(entry);evict();throw error;}
+    if(!active()){geometry.dispose();entry.refs--;releasePreviewAsset(entry);evict();return;}
+    const previous=state.records.get(id),reuse=record.preview&&previous?.sourceMaterial===geom.mesh.material&&previous.composited===!!record.result.composited;
+    if(!reuse)removeReplacement(state,id);
+    const material=reuse?previous.mesh.material:materialFor(geom.mesh.material,entry,record.attributes.color || [0,0,0,1],attributes.size);
+    if(reuse){
+      geometry=updatePreviewGeometry(previous.mesh.geometry,geometry);
+      material.uniforms.fkBrush.value=entry.texture;material.uniforms.fkCoverage.value=entry.mask;
+      const color=record.attributes.color||[0,0,0,1];material.uniforms.fkBaseColor.value=[color[0]/255,color[1]/255,color[2]/255,color[3]??1];
+      if(material.uniforms.fkDepthBias)material.uniforms.fkDepthBias.value=Math.max(Number(attributes.size)||api.fallbackSize,.00001)*.005;
+    }
+    if(!reuse&&record.result.composited){
       material.blending=5;material.blendSrc=201;material.blendDst=200;material.blendSrcAlpha=201;material.blendDstAlpha=200;
       // The backdrop already contains host shading/patterns. Do not shade it a
       // second time after Krita has blended its colors.
       if(material.fragmentShader.includes("out vec4 gColor"))material.fragmentShader=material.fragmentShader.replace(/}\s*$/,"gColor = fkSample; gBloom = vec4(0.0, 0.0, 0.0, fkSample.a);\n}");
     }
-    const mesh=new api.Mesh(geometry,material);mesh.castShadow=geom.mesh.castShadow;mesh.receiveShadow=geom.mesh.receiveShadow;
+    const mesh=reuse?previous.mesh:new api.Mesh(geometry,material);mesh.castShadow=geom.mesh.castShadow;mesh.receiveShadow=geom.mesh.receiveShadow;
     mesh.renderOrder=record.preview?Number.MAX_SAFE_INTEGER-1:paintOrder(id,record.paintOrder);mesh.matrixAutoUpdate=false;mesh.matrix.copy(geom.mesh.matrix);
     mesh.onBeforeRender=()=>syncUniforms(geom.mesh.material,material);
     const indexCount=info.fkIndexCount??((info.numOfPoints-1)*24+12);
@@ -542,11 +686,13 @@
       mesh.visible=geom.mesh.visible;mesh.matrix.copy(geom.mesh.matrix);mesh.matrixWorldNeedsUpdate=true;
       const start=geom.geometry.drawRange.start,end=start+geom.geometry.drawRange.count;
       const first=clamp((start-info.geomIndex)/indexCount,0,1),last=clamp((end-info.geomIndex)/indexCount,0,1);
-      const begin=Math.floor(first*geometry.index.count/6)*6,finish=Math.floor(last*geometry.index.count/6)*6;
+      const used=geometry.userData.fkUsedIndices??geometry.index.count;
+      const begin=Math.floor(first*used/6)*6,finish=Math.floor(last*used/6)*6;
       geometry.setDrawRange(begin,Math.max(0,finish-begin));
     };
-    syncVisibility();manager.sceneGroup.add(mesh);
-    hideCurve(manager,info,state,id);state.records.set(id,{mesh,entry,syncVisibility,info,source:geom.geometry});evict();api.redraw?.();
+    syncVisibility();if(!reuse)manager.sceneGroup.add(mesh);
+    hideCurve(manager,info,state,id);state.records.set(id,{mesh,entry,syncVisibility,info,source:geom.geometry,sourceMaterial:geom.mesh.material,composited:!!record.result.composited});
+    if(reuse){previous.entry.refs--;releasePreviewAsset(previous.entry);}evict();api.redraw?.();
     if(guideDirty.has(record)&&!record.preview){guideDirty.delete(record);save(id,record).catch(fail);}
   }
   function register(manager){if(!states.has(manager)){states.set(manager,{depth:0,generation:0,records:new Map(),hidden:new Map(),pending:new Map(),dirty:new Set()});managers.add(manager);}return states.get(manager);}
@@ -684,15 +830,15 @@
     let holder=previews.get(mesh);
     const stop=!mesh.geometry.drawRange.count||!attributes.shape;
     if(stop){
-      if(holder){holder.epoch++;clearTimeout(holder.timer);holder.timer=null;holder.latest=null;clearState(states.get(holder.manager));holder.manager.curveIdToGeomInfo.clear();}
+      if(holder){holder.epoch++;clearTimeout(holder.timer);holder.timer=null;holder.latest=null;holder.signature=null;holder.cache={};clearState(states.get(holder.manager));holder.manager.curveIdToGeomInfo.clear();}
       gesture=null;return;
     }
     if(!gesture)gesture={bindings:{...bindings}};
     const preset=gesture.bindings[attributes.shape];if(!preset)return;
     if(!holder){
       const manager={sceneGroup:mesh.parent,curveIdToGeomInfo:new Map(),getGeomFromInfo:()=>({geometry:mesh.geometry,mesh})};
-      holder={manager,timer:null,latest:null,epoch:0,running:false,disposed:false};previews.set(mesh,holder);register(manager);
-      mesh.addEventListener("removed",()=>{holder.disposed=true;holder.epoch++;clearTimeout(holder.timer);clearState(states.get(manager));managers.delete(manager);});
+      holder={manager,timer:null,latest:null,epoch:0,running:false,disposed:false,signature:null,cache:{}};previews.set(mesh,holder);register(manager);
+      mesh.addEventListener("removed",()=>{holder.disposed=true;holder.epoch++;holder.latest=null;holder.cache={};holder.signature=null;clearTimeout(holder.timer);clearState(states.get(manager));managers.delete(manager);});
     }
     const count=attributes.points?.length || 0;
     if(count<2)return;
@@ -708,6 +854,8 @@
       const latest=holder.latest;holder.latest=null;holder.running=true;
       const epoch=holder.epoch,active=()=>!holder.disposed&&epoch===holder.epoch&&!!mesh.parent;
       try{
+        const signature=JSON.stringify([latest.preset,latest.attributes,cameraRight()]);
+        if(signature===holder.signature)return;
         const a=clone(latest.attributes);
         // The host keeps raw normals separate from densified positions. Use the
         // same raw normals as its committed stroke when constructing the native
@@ -715,15 +863,20 @@
         if(a.renderNormals?.length)a.normals=a.renderNormals;
         delete a.renderNormals;
         const record={version:2,preset:latest.preset,preview:true,attributes:a};
-        const rendered=await renderRecord(null,record,active);
+        const rendered=await renderRecord(null,record,active,holder.cache);
         if(!rendered||!active())return;
-        const entry=await loadAssets(record);if(!active())return;
         const info={attributes:a,numOfPoints:a.points.length,geomAttributes:0,geomIndex:0,fkIndexCount:latest.indexCount};
+        if(!record.surface?.depth){
+          record.guideSurface=guideSurface(record.frame,a);
+        }
+        const entry=await loadAssets(record,active);if(!active()){releasePreviewAsset(entry);return;}
         holder.manager.curveIdToGeomInfo.set("preview",info);
         await replaceCurve(holder.manager,state,"preview",info,record,entry,a,active);
-      }catch(error){fail(error);}finally{
+        if(active())holder.signature=signature;
+      }catch(error){if(active())fail(error);}finally{
         holder.running=false;
-        if(holder.latest&&!holder.disposed)queueMicrotask(run);
+        // Let the host render and process Pencil input before another prefix.
+        if(holder.latest&&!holder.disposed)holder.timer=setTimeout(run,0);
       }
     };
     if(!holder.running)void run();

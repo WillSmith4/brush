@@ -60,8 +60,17 @@ quads that can cut through the support. The contacted patch is saved with the
 stroke, so reopening it without the Guide preserves its surface. Native preview
 uses that same support while drawing. Existing PNG paint is retained.
 
-Each completed native preview owns its raster image and the corresponding
-geometry. A newer partial path never stretches an older result. The original
+Live previews reuse their mesh, material, and GPU buffer capacity, growing the
+buffers only when needed. Raster and geometry are updated together; a newer
+partial path never stretches an older result. Superseded preview textures are
+released immediately. Identical input fragments and native render requests are
+cached. Coverage scanning, spatial indexing, and mesh generation yield in short
+batches, including while Pencil is down. Shared mesh corners reuse the same
+surface calculation, and unchanged Guide faces skip nearest-path searches and
+pixel scanning that cannot affect their geometry. The native brush resolution,
+sampling, preset dynamics, and final paint representation remain unchanged.
+
+The original
 raw surface normals are retained alongside densified preview normals so both
 preview and committed paint construct the same raster frame.
 

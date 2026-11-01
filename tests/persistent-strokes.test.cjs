@@ -251,12 +251,49 @@ test('while a new native prefix is delayed the previous native result remains un
  const first=f.manager.sceneGroup.children.find(m=>m.geometry.attributes.fkUV),before=Array.from(first.geometry.attributes.position.array),texture=first.material.uniforms.fkBrush.value;
  let release;const delayed=new Promise(r=>release=r),post=f.context.webkit.messageHandlers.FeatherKrita.postMessage;
  f.context.webkit.messageHandlers.FeatherKrita.postMessage=async body=>{if(body.command==='render')await delayed;return post(body);};
- for(let i=0;i<10;i++)f.fk.preview(mesh,{...f.attributes,points:f.attributes.points.map(p=>({...p,y:p.y+i*.1}))});
+ for(let i=0;i<10;i++)f.fk.preview(mesh,{...f.attributes,points:f.attributes.points.map(p=>({...p,y:p.y+i*.1*p.x}))});
  await tick();assert.ok(first.visible&&first.parent);assert.equal(first.material.uniforms.fkBrush.value,texture);assert.deepEqual(Array.from(first.geometry.attributes.position.array),before);
- release();for(let i=0;i<200&&first.parent;i++)await new Promise(r=>setTimeout(r,5));
- assert.equal(first.parent,null);assert.ok(f.manager.sceneGroup.children.some(m=>m.geometry.attributes.fkUV));
+ release();for(let i=0;i<200&&first.material.uniforms.fkBrush.value===texture;i++)await new Promise(r=>setTimeout(r,5));
+ assert.ok(first.parent);assert.notEqual(first.material.uniforms.fkBrush.value,texture);
  geometry.setDrawRange(0,0);f.fk.preview(mesh,{});await new Promise(r=>setTimeout(r,30));
  assert.ok(!f.manager.sceneGroup.children.some(m=>m.geometry.attributes.fkUV));assert.deepEqual(f.errors,[]);
+});
+
+test('unchanged live fragments are cached and growing previews reuse their mesh and buffers',async()=>{
+ const f=fixture();f.manager.makeCurve('live',f.attributes);await settled();
+ const {mesh}=f.manager.getGeomFromInfo(f.manager.curveIdToGeomInfo.get('live'));
+ mesh.geometry.setDrawRange(0,mesh.geometry.index.count);
+ f.fk.setBindings({RECT:'rect'});f.fk.preview(mesh,f.attributes);
+ const wait=async predicate=>{for(let i=0;i<300&&!predicate();i++)await new Promise(r=>setTimeout(r,5));assert.ok(predicate());};
+ await wait(()=>f.manager.sceneGroup.children.some(m=>m.geometry.attributes.fkUV));
+ const paint=f.manager.sceneGroup.children.find(m=>m.geometry.attributes.fkUV),geometry=paint.geometry,material=paint.material,buffer=geometry.attributes.position.array;
+ const texture=material.uniforms.fkBrush.value,mask=material.uniforms.fkCoverage.value;let disposed=0;
+ texture.addEventListener('dispose',()=>disposed++);mask.addEventListener('dispose',()=>disposed++);
+ for(let i=0;i<25;i++)f.fk.preview(mesh,clone(f.attributes));
+ await new Promise(r=>setTimeout(r,40));assert.equal(f.requests.filter(r=>r.command==='render').length,1);
+ assert.equal(material.uniforms.fkBrush.value,texture);
+ f.fk.preview(mesh,{...f.attributes,points:f.attributes.points.map(p=>({...p,x:p.x*1.5}))});
+ await wait(()=>material.uniforms.fkBrush.value!==texture);
+ assert.equal(f.manager.sceneGroup.children.find(m=>m.geometry.attributes.fkUV),paint);
+ assert.equal(paint.geometry,geometry);assert.equal(paint.material,material);
+ assert.ok(geometry.attributes.position.array.length>=buffer.length);
+ assert.equal(disposed,2);assert.ok(geometry.drawRange.count>0&&geometry.drawRange.count<=geometry.index.count);assert.deepEqual(f.errors,[]);
+ const capacity=geometry.attributes.position.array,secondTexture=material.uniforms.fkBrush.value;
+ f.fk.preview(mesh,{...f.attributes,points:f.attributes.points.map(p=>({...p,x:p.x*1.2}))});
+ await wait(()=>material.uniforms.fkBrush.value!==secondTexture);assert.equal(geometry.attributes.position.array,capacity);
+ const next=material.uniforms.fkBrush.value;next.addEventListener('dispose',()=>disposed++);
+ mesh.geometry.setDrawRange(0,0);f.fk.preview(mesh,{});assert.equal(disposed,3);
+});
+
+test('nonplanar live geometry yields during construction and can be cancelled without reviving paint',async()=>{
+ const f=fixture(),a={...f.attributes,size:.2,pressures:[],points:[],normals:[]};
+ for(let i=0;i<1200;i++){const t=i*.025;a.points.push({x:3*Math.cos(t),y:3*Math.sin(t),z:.1*Math.sin(t*3)});a.normals.push({x:0,y:0,z:1});}
+ f.manager.makeCurve('live',a);await settled();const {mesh}=f.manager.getGeomFromInfo(f.manager.curveIdToGeomInfo.get('live'));
+ f.fk.setBindings({RECT:'rect'});let beats=0;const timer=setInterval(()=>beats++,1);f.fk.preview(mesh,a);
+ for(let i=0;i<600&&!f.manager.sceneGroup.children.some(m=>m.geometry.attributes.fkUV);i++)await new Promise(r=>setTimeout(r,5));
+ clearInterval(timer);assert.ok(beats>2);assert.ok(f.manager.sceneGroup.children.some(m=>m.geometry.attributes.fkUV));
+ f.fk.preview(mesh,{...a,size:.3});await tick();mesh.geometry.setDrawRange(0,0);f.fk.preview(mesh,{});
+ await new Promise(r=>setTimeout(r,150));assert.ok(!f.manager.sceneGroup.children.some(m=>m.geometry.attributes.fkUV));assert.deepEqual(f.errors,[]);
 });
 
 test('transparent paint does not write depth and preserves its layer order after redraw',async()=>{
