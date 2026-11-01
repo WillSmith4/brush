@@ -11,6 +11,9 @@
 #include <QImageReader>
 #include <QFile>
 #include <QUuid>
+#include <QPainter>
+#include <QSet>
+#include <QRegion>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -211,7 +214,7 @@ QJsonObject presetInfo(const QJsonObject &request) {
             std::abs(bounds.right()) / 64.0, std::abs(bounds.top()) / 64.0,
             std::abs(bounds.bottom()) / 64.0})},
         {"samplesBackdrop", engine == "colorsmudge" || engine == "filter"},
-        {"previewSessions", true}, {"previewPixels", true}};
+        {"previewSessions", true}, {"previewPixels", true}, {"strokeStreaming", 1}};
 }
 
 QString encodePng(const QImage &image) {
@@ -233,6 +236,24 @@ struct RenderJob {
     KisStrokeId stroke;
     bool started = false, ended = false;
     int submitted = 0;
+    bool streaming = false;
+    KisPaintDeviceSP base;
+    QSet<quint64> loadedTiles;
+    QRect paintedBounds;
+    QSet<quint64> pendingTiles;
+    int streamCount = 0;
+};
+
+class StreamLayer final : public KisPaintLayer {
+public:
+    using KisPaintLayer::KisPaintLayer;
+    void setDirty(const QVector<QRect> &rects) override {
+        { std::lock_guard<std::mutex> lock(mutex); for (const auto &r : rects) dirty += r; }
+        KisPaintLayer::setDirty(rects);
+    }
+    QRegion takeDirty() { std::lock_guard<std::mutex> lock(mutex); const auto r = dirty; dirty = QRegion(); return r; }
+private:
+    std::mutex mutex; QRegion dirty;
 };
 
 // Only the UI thread accesses the session table. All rendering/closing work is
@@ -268,7 +289,8 @@ std::shared_ptr<RenderJob> prepareRender(const QJsonObject &request) {
     require(presets.contains(id), "The selected brush preset is no longer loaded.");
     const int width = request["width"].toInt(), height = request["height"].toInt();
     const QJsonArray points = request["points"].toArray(), color = request["color"].toArray();
-    require(width > 0 && width <= 4096 && height > 0 && height <= 4096 &&
+    const bool stream = request["streamBegin"].toBool();
+    require(stream ? width == 16384 && height == 16384 : width > 0 && width <= 4096 && height > 0 && height <= 4096 &&
         qint64(width) * height <= 2097152, "The requested stroke texture is too large.");
     require(!points.isEmpty() && points.size() <= 10000 && color.size() >= 3, "Invalid stroke input.");
     const double size = request["size"].toDouble();
@@ -279,7 +301,7 @@ std::shared_ptr<RenderJob> prepareRender(const QJsonObject &request) {
     const auto *space = KoColorSpaceRegistry::instance()->rgb8();
     KisImageSP image = new KisImage(new KisDumbUndoStore(), width, height, space, "Stroke texture");
     image->setWorkingThreadsLimit(1);
-    KisPaintLayerSP layer = new KisPaintLayer(image, "Brush", OPACITY_OPAQUE_U8);
+    KisPaintLayerSP layer = stream ? new StreamLayer(image, "Brush", OPACITY_OPAQUE_U8) : new KisPaintLayer(image, "Brush", OPACITY_OPAQUE_U8);
     image->addNode(layer, image->rootLayer());
     // Smudge reads the actual visible host artwork, including native Feather
     // strokes. Seed the working layer itself, so both smudge overlay modes work.
@@ -309,6 +331,8 @@ std::shared_ptr<RenderJob> prepareRender(const QJsonObject &request) {
     job->image = image; job->layer = layer; job->backdrop = backdrop;
     job->width = width; job->height = height;
     job->resources = resources; job->points = points; job->settings = request;
+    job->streaming = stream;
+    if (stream) job->base = new KisPaintDevice(space);
     return job;
 }
 
@@ -318,7 +342,7 @@ void submitPoints(RenderJob &job) {
     const int first = job.submitted ? job.submitted - 1 : 0;
     for (int i = first; i < job.points.size(); ++i) points.append(point(job.points[i].toArray()));
     if (!job.started) {
-        job.image->initialRefreshGraph();
+        if (!job.streaming) job.image->initialRefreshGraph();
         auto *strategy = new FreehandStrokeStrategy(job.resources, new KisFreehandStrokeInfo(),
             kundo2_noi18n("Brush texture"), FreehandStrokeStrategy::None, job.settings["seed"].toInt(1));
         job.stroke = job.image->startStroke(strategy); job.started = true;
@@ -418,6 +442,7 @@ QJsonObject finishRender(RenderJob &job, bool live = false, bool pixels = false)
     return {{"width", width}, {"height", height}, {"png", encodePng(output)},
         {"coverage", encodePng(coverage)}, {"composited", !backdrop.isNull()}};
 }
+#include "KritaStream.inc"
 }
 
 extern "C" char *FKRequest(const char *json) {
@@ -461,6 +486,8 @@ extern "C" void FKRenderAsync(const char *json, FKRenderCompletion completion, v
         QString session;
         bool live = false, close = false, failed = false;
         bool pixels = false;
+        bool stream = false;
+        QJsonObject streamRequest;
         bool verified = false;
         QString preset;
         int appended = 0;
@@ -482,6 +509,7 @@ extern "C" void FKRenderAsync(const char *json, FKRenderCompletion completion, v
         require(pending->session.size() <= 128, "Invalid live stroke identifier.");
         pending->live = !pending->session.isEmpty(); pending->close = request["previewEnd"].toBool();
         pending->pixels = request["previewPixels"].toBool();
+        pending->stream = request.contains("streamFrom");pending->streamRequest = request;
         // Raw previews use the exact completed paint callback. Dynamic host
         // projection usually invalidates append-only sessions; avoid creating
         // and comparing two full images for a prefix that cannot be reused.
@@ -492,6 +520,13 @@ extern "C" void FKRenderAsync(const char *json, FKRenderCompletion completion, v
         if (pending->close) {
             if (previous) { pending->retired.push_back(previous); previewSessions.remove(pending->session); }
         } else {
+            if (pending->stream) {
+                require(pending->live,"Missing live stroke identifier.");
+                if(request["streamBegin"].toBool()){
+                    require(!previous,"The live stroke already exists.");pending->job=prepareRender(request);
+                    require(previewSessions.size()<4,"Too many simultaneous live strokes.");previewSessions.insert(pending->session,pending->job);
+                }else{require(previous&&previous->streaming&&previous->settings["preset"]==request["preset"],"Unknown live stroke.");pending->job=previous;}
+            } else {
             if (verifiedSessionPresets.contains(pending->preset) && !verifiedSessionPresets[pending->preset]) pending->live = false;
             const int count = request["points"].toArray().size();
             require(count > 0 && count <= 10000, "Invalid stroke input.");
@@ -514,6 +549,7 @@ extern "C" void FKRenderAsync(const char *json, FKRenderCompletion completion, v
                 }
                 previewSessions.insert(pending->session, pending->job);
             }
+            }
         }
         pending->completion = completion; pending->context = context;
         renderBusy = true;
@@ -522,7 +558,7 @@ extern "C" void FKRenderAsync(const char *json, FKRenderCompletion completion, v
             QJsonObject response;
             try {
                 for (auto &old : pending->retired) closeRender(*old);
-                response = pending->close ? QJsonObject{{"closed", true}} : finishRender(*pending->job, pending->live, pending->pixels);
+                response = pending->close ? QJsonObject{{"closed", true}} : pending->stream ? renderStream(*pending->job,pending->streamRequest) : finishRender(*pending->job, pending->live, pending->pixels);
                 if (pending->reference) {
                     const auto reference = finishRender(*pending->reference);
                     pending->verified = response["png"] == reference["png"] && response["coverage"] == reference["coverage"];
@@ -538,6 +574,7 @@ extern "C" void FKRenderAsync(const char *json, FKRenderCompletion completion, v
             dispatch_async_f(dispatch_get_main_queue(), pending, [](void *raw) {
                 std::unique_ptr<Pending> pending(static_cast<Pending *>(raw));
                 if (pending->failed && previewSessions.value(pending->session) == pending->job) previewSessions.remove(pending->session);
+                if (pending->stream && pending->streamRequest["streamFinish"].toBool()) previewSessions.remove(pending->session);
                 if (pending->reference && !pending->failed) {
                     verifiedSessionPresets.insert(pending->preset, pending->verified);
                     if (!pending->verified) previewSessions.remove(pending->session);
