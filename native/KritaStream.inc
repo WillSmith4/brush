@@ -61,6 +61,9 @@ QJsonObject renderStream(RenderJob &job,const QJsonObject &request) {
     }
     if(request["streamFinish"].toBool()){
         closeRender(job);const QRect bounds=job.paintedBounds.isEmpty()?QRect(8192,8192,1,1):job.paintedBounds;
+        // Current adapters persist exact live tiles. Closing their painter must
+        // not rasterize/scale/PNG-encode the entire document footprint again.
+        if(request["streamTilesOnly"].toBool())return {{"width",bounds.width()},{"height",bounds.height()},{"composited",job.settings["streamBackdrop"].toBool()},{"streamCount",job.streamCount},{"streamScale",1.0},{"streamX",bounds.x()},{"streamY",bounds.y()},{"tilesOnly",true}};
         const double scale=std::min({1.0,4094.0/bounds.width(),4094.0/bounds.height(),std::sqrt(2090000.0/(double(bounds.width())*bounds.height()))});
         const QSize size(std::max(1,int(std::ceil(bounds.width()*scale))),std::max(1,int(std::ceil(bounds.height()*scale))));
         QImage output(size,QImage::Format_ARGB32_Premultiplied),mask(size,QImage::Format_ARGB32_Premultiplied);output.fill(Qt::transparent);mask.fill(Qt::transparent);

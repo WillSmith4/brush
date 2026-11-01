@@ -214,7 +214,7 @@ QJsonObject presetInfo(const QJsonObject &request) {
             std::abs(bounds.right()) / 64.0, std::abs(bounds.top()) / 64.0,
             std::abs(bounds.bottom()) / 64.0})},
         {"samplesBackdrop", engine == "colorsmudge" || engine == "filter"},
-        {"previewSessions", true}, {"previewPixels", true}, {"strokeStreaming", 1}};
+        {"previewSessions", true}, {"previewPixels", true}, {"strokeStreaming", 1}, {"streamTilesOnly", true}};
 }
 
 QString encodePng(const QImage &image) {
