@@ -9,6 +9,8 @@
 #include <QFileInfo>
 #include <QImage>
 #include <QImageReader>
+#include <QFile>
+#include <QUuid>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -209,7 +211,7 @@ QJsonObject presetInfo(const QJsonObject &request) {
             std::abs(bounds.right()) / 64.0, std::abs(bounds.top()) / 64.0,
             std::abs(bounds.bottom()) / 64.0})},
         {"samplesBackdrop", engine == "colorsmudge" || engine == "filter"},
-        {"previewSessions", true}};
+        {"previewSessions", true}, {"previewPixels", true}};
 }
 
 QString encodePng(const QImage &image) {
@@ -238,6 +240,7 @@ struct RenderJob {
 // paint jobs or waits for the image scheduler to finish.
 QMap<QString, std::shared_ptr<RenderJob>> previewSessions;
 QMap<QString, bool> verifiedSessionPresets;
+QStringList previewFiles;
 bool renderBusy = false;
 dispatch_queue_t renderQueue() {
     static dispatch_queue_t queue = dispatch_queue_create("FeatherKrita.native-render", DISPATCH_QUEUE_SERIAL);
@@ -371,7 +374,7 @@ QImage captureLive(RenderJob &job) {
     return capture->output;
 }
 
-QJsonObject finishRender(RenderJob &job, bool live = false) {
+QJsonObject finishRender(RenderJob &job, bool live = false, bool pixels = false) {
     const int width = job.width, height = job.height;
     const auto &layer = job.layer;
     const QImage &backdrop = job.backdrop;
@@ -390,6 +393,27 @@ QJsonObject finishRender(RenderJob &job, bool live = false) {
             if (changed) mask[x] = qRgba(255, 255, 255, 255);
             else row[x] = 0;
         }
+    }
+    if (pixels) {
+        // WKWebView receives a small token, not two large base64 PNG strings.
+        // Byte layout: tightly packed straight RGBA followed by one coverage
+        // byte per pixel. Keep full resolution and all native paint values.
+        const QString folder = storageRoot + "/PreviewPixels";
+        require(QDir().mkpath(folder), "Cannot create the live texture folder.");
+        const QString token = QUuid::createUuid().toString(QUuid::WithoutBraces) + ".rgba";
+        const QString path = folder + "/" + token;
+        const QImage rgba = output.convertToFormat(QImage::Format_RGBA8888);
+        QByteArray mask; mask.resize(width * height);
+        for (int y = 0; y < height; ++y) {
+            const auto *row = reinterpret_cast<const QRgb *>(coverage.constScanLine(y));
+            for (int x = 0; x < width; ++x) mask[y * width + x] = char(qAlpha(row[x]));
+        }
+        QFile file(path); require(file.open(QIODevice::WriteOnly), "Cannot open the live texture file.");
+        for (int y = 0; y < height; ++y) require(file.write(reinterpret_cast<const char *>(rgba.constScanLine(y)), width * 4) == width * 4, "Cannot write live pixels.");
+        require(file.write(mask) == mask.size(), "Cannot write live coverage."); file.close();
+        previewFiles.append(path);
+        while (previewFiles.size() > 8) QFile::remove(previewFiles.takeFirst());
+        return {{"width", width}, {"height", height}, {"pixels", token}, {"composited", !backdrop.isNull()}};
     }
     return {{"width", width}, {"height", height}, {"png", encodePng(output)},
         {"coverage", encodePng(coverage)}, {"composited", !backdrop.isNull()}};
@@ -436,6 +460,7 @@ extern "C" void FKRenderAsync(const char *json, FKRenderCompletion completion, v
         std::vector<std::shared_ptr<RenderJob>> retired;
         QString session;
         bool live = false, close = false, failed = false;
+        bool pixels = false;
         bool verified = false;
         QString preset;
         int appended = 0;
@@ -456,6 +481,11 @@ extern "C" void FKRenderAsync(const char *json, FKRenderCompletion completion, v
         pending->session = request["previewSession"].toString();
         require(pending->session.size() <= 128, "Invalid live stroke identifier.");
         pending->live = !pending->session.isEmpty(); pending->close = request["previewEnd"].toBool();
+        pending->pixels = request["previewPixels"].toBool();
+        // Raw previews use the exact completed paint callback. Dynamic host
+        // projection usually invalidates append-only sessions; avoid creating
+        // and comparing two full images for a prefix that cannot be reused.
+        require(!pending->pixels || !pending->live, "Conflicting preview modes.");
         pending->preset = request["preset"].toString();
         require(!pending->close || pending->live, "Missing live stroke identifier.");
         auto previous = previewSessions.value(pending->session);
@@ -492,7 +522,7 @@ extern "C" void FKRenderAsync(const char *json, FKRenderCompletion completion, v
             QJsonObject response;
             try {
                 for (auto &old : pending->retired) closeRender(*old);
-                response = pending->close ? QJsonObject{{"closed", true}} : finishRender(*pending->job, pending->live);
+                response = pending->close ? QJsonObject{{"closed", true}} : finishRender(*pending->job, pending->live, pending->pixels);
                 if (pending->reference) {
                     const auto reference = finishRender(*pending->reference);
                     pending->verified = response["png"] == reference["png"] && response["coverage"] == reference["coverage"];
