@@ -22,6 +22,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <mutex>
+#include <condition_variable>
+#include <vector>
+#include <KisRunnableStrokeJobData.h>
+#include <kis_painter.h>
 
 #include <KoColor.h>
 #include <KoColorSpaceRegistry.h>
@@ -203,7 +208,8 @@ QJsonObject presetInfo(const QJsonObject &request) {
         {"extent", std::max({1.0, std::abs(bounds.left()) / 64.0,
             std::abs(bounds.right()) / 64.0, std::abs(bounds.top()) / 64.0,
             std::abs(bounds.bottom()) / 64.0})},
-        {"samplesBackdrop", engine == "colorsmudge" || engine == "filter"}};
+        {"samplesBackdrop", engine == "colorsmudge" || engine == "filter"},
+        {"previewSessions", true}};
 }
 
 QString encodePng(const QImage &image) {
@@ -219,7 +225,23 @@ struct RenderJob {
     KisPaintLayerSP layer;
     QImage backdrop;
     int width = 0, height = 0;
+    KisResourcesSnapshotSP resources;
+    QJsonArray points;
+    QJsonObject settings;
+    KisStrokeId stroke;
+    bool started = false, ended = false;
+    int submitted = 0;
 };
+
+// Only the UI thread accesses the session table. All rendering/closing work is
+// serialized on the engine queue; the WebKit thread never enqueues thousands of
+// paint jobs or waits for the image scheduler to finish.
+QMap<QString, std::shared_ptr<RenderJob>> previewSessions;
+bool renderBusy = false;
+dispatch_queue_t renderQueue() {
+    static dispatch_queue_t queue = dispatch_queue_create("FeatherKrita.native-render", DISPATCH_QUEUE_SERIAL);
+    return queue;
+}
 
 void matchCursorSize(KisPaintOpPresetSP preset, double size) {
     // The cursor deliberately ignores the preset's static Size sensor value.
@@ -237,7 +259,7 @@ void matchCursorSize(KisPaintOpPresetSP preset, double size) {
     preset->settings()->setPaintOpSize(size * correction);
 }
 
-std::unique_ptr<RenderJob> prepareRender(const QJsonObject &request) {
+std::shared_ptr<RenderJob> prepareRender(const QJsonObject &request) {
     const QString id = request["preset"].toString();
     require(presets.contains(id), "The selected brush preset is no longer loaded.");
     const int width = request["width"].toInt(), height = request["height"].toInt();
@@ -269,7 +291,6 @@ std::unique_ptr<RenderJob> prepareRender(const QJsonObject &request) {
         require(!backdrop.isNull(), "Cannot decode the brush backdrop.");
         layer->paintDevice()->convertFromQImage(backdrop, nullptr);
     }
-    image->initialRefreshGraph();
     // Compare in the engine's actual color space, after import/rounding, so
     // unrelated pixels never become part of the returned paint surface.
     if (!backdrop.isNull()) backdrop = layer->paintDevice()->convertToQImage(nullptr, 0, 0, width, height).convertToFormat(QImage::Format_ARGB32);
@@ -280,33 +301,80 @@ std::unique_ptr<RenderJob> prepareRender(const QJsonObject &request) {
     resources->setBGColorOverride(KoColor(Qt::white, space));
     resources->setOpacity(std::clamp(request["opacity"].toDouble(1.0), 0.0, 1.0));
     resources->setMirroring(false, false);
-    QVector<KisPaintInformation> validatedPoints;
-    validatedPoints.reserve(points.size());
-    for (const auto &value : points) validatedPoints.append(point(value.toArray()));
-    auto *strategy = new FreehandStrokeStrategy(resources, new KisFreehandStrokeInfo(),
-        kundo2_noi18n("Brush texture"), FreehandStrokeStrategy::None, request["seed"].toInt(1));
-    const KisStrokeId stroke = image->startStroke(strategy);
-    auto previous = validatedPoints[0];
-    if (validatedPoints.size() == 1) image->addJob(stroke, new FreehandStrokeStrategy::Data(0, previous));
-    for (int i = 1; i < validatedPoints.size(); ++i) {
-        auto next = validatedPoints[i];
-        image->addJob(stroke, new FreehandStrokeStrategy::Data(0, previous, next));
-        previous = next;
-    }
-    image->addJob(stroke, new KisAsynchronousStrokeUpdateHelper::UpdateData(true));
-    image->endStroke(stroke);
-    auto job = std::make_unique<RenderJob>();
+    auto job = std::make_shared<RenderJob>();
     job->image = image; job->layer = layer; job->backdrop = backdrop;
     job->width = width; job->height = height;
+    job->resources = resources; job->points = points; job->settings = request;
     return job;
 }
 
-QJsonObject finishRender(RenderJob &job) {
+void submitPoints(RenderJob &job) {
+    // Validate the entire addition before changing the live painter.
+    QVector<KisPaintInformation> points;
+    const int first = job.submitted ? job.submitted - 1 : 0;
+    for (int i = first; i < job.points.size(); ++i) points.append(point(job.points[i].toArray()));
+    if (!job.started) {
+        job.image->initialRefreshGraph();
+        auto *strategy = new FreehandStrokeStrategy(job.resources, new KisFreehandStrokeInfo(),
+            kundo2_noi18n("Brush texture"), FreehandStrokeStrategy::None, job.settings["seed"].toInt(1));
+        job.stroke = job.image->startStroke(strategy); job.started = true;
+        if (job.points.size() == 1) job.image->addJob(job.stroke, new FreehandStrokeStrategy::Data(0, points[0]));
+    }
+    for (int i = 1; i < points.size(); ++i)
+        job.image->addJob(job.stroke, new FreehandStrokeStrategy::Data(0, points[i - 1], points[i]));
+    job.submitted = job.points.size();
+    job.image->addJob(job.stroke, new KisAsynchronousStrokeUpdateHelper::UpdateData(true));
+}
+
+void closeRender(RenderJob &job) {
+    if (job.started && !job.ended) {
+        job.image->endStroke(job.stroke); job.ended = true;
+        job.image->waitForDone();
+    }
+}
+
+bool canAppend(const RenderJob &job, const QJsonObject &request) {
+    // A changed projection, pressure, brush setting or sampled backdrop needs
+    // a fresh replay. Never reuse incompatible paint just to make preview fast.
+    if (job.ended || job.submitted < 2 || request["points"].toArray().size() < job.submitted) return false;
+    for (const char *key : {"preset", "size", "color", "opacity", "seed", "backdrop", "width", "height"})
+        if (job.settings[key] != request[key]) return false;
+    const auto next = request["points"].toArray();
+    for (int i = 0; i < job.submitted; ++i) if (next[i] != job.points[i]) return false;
+    return true;
+}
+
+QImage captureLive(RenderJob &job) {
+    // waitForDone() cannot be used with an open stroke. A barrier runs after the
+    // paintop's inserted asynchronous/masking updates, while preserving its
+    // spacing, random source and smudge state for the next appended points.
+    std::mutex mutex; std::condition_variable ready; bool done = false;
+    QImage output; std::exception_ptr failure;
+    job.image->addJob(job.stroke, new KisRunnableStrokeJobData([&] {
+        try {
+            KisPaintDeviceSP copy = new KisPaintDevice(*job.layer->paintDevice());
+            if (job.layer->hasTemporaryTarget()) {
+                KisIndirectPaintingSupport::ReadLocker lock(job.layer.data());
+                KisPainter painter(copy); job.layer->setupTemporaryPainter(&painter);
+                painter.bitBlt(QPoint(0, 0), job.layer->temporaryTarget(), QRect(0, 0, job.width, job.height));
+            }
+            output = copy->convertToQImage(nullptr, 0, 0, job.width, job.height).convertToFormat(QImage::Format_ARGB32);
+        } catch (...) { failure = std::current_exception(); }
+        { std::lock_guard<std::mutex> lock(mutex); done = true; } ready.notify_one();
+    }, KisStrokeJobData::BARRIER));
+    std::unique_lock<std::mutex> lock(mutex); ready.wait(lock, [&] { return done; });
+    if (failure) std::rethrow_exception(failure);
+    return output;
+}
+
+QJsonObject finishRender(RenderJob &job, bool live = false) {
     const int width = job.width, height = job.height;
     const auto &layer = job.layer;
     const QImage &backdrop = job.backdrop;
-    job.image->waitForDone();
-    QImage output = layer->paintDevice()->convertToQImage(nullptr, 0, 0, width, height).convertToFormat(QImage::Format_ARGB32);
+    submitPoints(job);
+    QImage output;
+    if (live) output = captureLive(job);
+    else { closeRender(job); output = layer->paintDevice()->convertToQImage(nullptr, 0, 0, width, height).convertToFormat(QImage::Format_ARGB32); }
     QImage coverage(width, height, QImage::Format_ARGB32);
     coverage.fill(Qt::transparent);
     for (int y = 0; y < height; ++y) {
@@ -359,7 +427,11 @@ extern "C" void FKFreeResponse(char *response) { std::free(response); }
 // and deliver the result back on its owner thread, exactly once.
 extern "C" void FKRenderAsync(const char *json, FKRenderCompletion completion, void *context) {
     struct Pending {
-        std::unique_ptr<RenderJob> job;
+        std::shared_ptr<RenderJob> job;
+        std::vector<std::shared_ptr<RenderJob>> retired;
+        QString session;
+        bool live = false, close = false, failed = false;
+        int appended = 0;
         FKRenderCompletion completion;
         void *context;
         QByteArray bytes;
@@ -367,23 +439,59 @@ extern "C" void FKRenderAsync(const char *json, FKRenderCompletion completion, v
     if (!completion) return;
     try {
         require(initialized && QThread::currentThread() == application->thread(), "The brush runtime is not ready on this thread.");
+        require(!renderBusy, "The native renderer already has an active request.");
         require(json, "Missing request.");
         QJsonParseError error;
         const auto document = QJsonDocument::fromJson(QByteArray(json), &error);
         require(error.error == QJsonParseError::NoError && document.isObject(), "Malformed brush request.");
+        const auto request = document.object();
         auto pending = std::make_unique<Pending>();
-        pending->job = prepareRender(document.object());
+        pending->session = request["previewSession"].toString();
+        require(pending->session.size() <= 128, "Invalid live stroke identifier.");
+        pending->live = !pending->session.isEmpty(); pending->close = request["previewEnd"].toBool();
+        require(!pending->close || pending->live, "Missing live stroke identifier.");
+        auto previous = previewSessions.value(pending->session);
+        if (pending->close) {
+            if (previous) { pending->retired.push_back(previous); previewSessions.remove(pending->session); }
+        } else {
+            const int count = request["points"].toArray().size();
+            require(count > 0 && count <= 10000, "Invalid stroke input.");
+            if (pending->live && previous && canAppend(*previous, request)) {
+                pending->job = previous;
+                pending->appended = count - previous->submitted;
+                previous->points = request["points"].toArray();
+            } else {
+                pending->job = prepareRender(request); pending->appended = count;
+                if (previous) { pending->retired.push_back(previous); previewSessions.remove(pending->session); }
+            }
+            if (pending->live) {
+                while (!previewSessions.contains(pending->session) && previewSessions.size() >= 4) {
+                    auto old = previewSessions.begin(); pending->retired.push_back(old.value()); previewSessions.erase(old);
+                }
+                previewSessions.insert(pending->session, pending->job);
+            }
+        }
         pending->completion = completion; pending->context = context;
-        dispatch_async_f(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), pending.release(), [](void *raw) {
+        renderBusy = true;
+        dispatch_async_f(renderQueue(), pending.release(), [](void *raw) {
             auto *pending = static_cast<Pending *>(raw);
             QJsonObject response;
-            try { response = finishRender(*pending->job); response["ok"] = true; }
-            catch (const std::exception &e) { response = {{"ok", false}, {"error", QString::fromUtf8(e.what())}}; }
-            catch (...) { response = {{"ok", false}, {"error", "The native brush renderer failed."}}; }
+            try {
+                for (auto &old : pending->retired) closeRender(*old);
+                response = pending->close ? QJsonObject{{"closed", true}} : finishRender(*pending->job, pending->live);
+                response["ok"] = true;
+                if (pending->live && !pending->close) response["appendedPoints"] = pending->appended;
+            }
+            catch (const std::exception &e) { pending->failed = true; response = {{"ok", false}, {"error", QString::fromUtf8(e.what())}}; }
+            catch (...) { pending->failed = true; response = {{"ok", false}, {"error", "The native brush renderer failed."}}; }
+            if (pending->failed && pending->job) closeRender(*pending->job);
             pending->bytes = QJsonDocument(response).toJson(QJsonDocument::Compact);
             dispatch_async_f(dispatch_get_main_queue(), pending, [](void *raw) {
                 std::unique_ptr<Pending> pending(static_cast<Pending *>(raw));
+                if (pending->failed && previewSessions.value(pending->session) == pending->job) previewSessions.remove(pending->session);
+                pending->retired.clear();
                 pending->job.reset();
+                renderBusy = false;
                 pending->completion(pending->bytes.constData(), pending->context);
             });
         });
