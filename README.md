@@ -74,8 +74,15 @@ IDs and the legacy baked PNG fallback. Rendering uses the tiles, so a large
 stroke is not visibly replaced by a resampled whole-stroke raster. Existing
 documents and already painted strokes are not rerendered.
 
-Claimed live meshes remain visible while the last samples and immutable tile
-records finish saving. Replacement is atomic once all saved tiles are ready.
+At Pencil-up, the finished host curve immediately adopts the existing live
+meshes. The curve owns their visibility, transforms and lifetime while the last
+samples and immutable tile records finish saving. This first handoff does not
+read tiles back from disk, decode them again or build a second visible mesh set.
+Undo/removal detaches paint immediately even if storage is still pending.
+The reusable Pencil mesh is released at handoff, and finished paint reads
+uniforms from its document curve instead of the next gesture's preview mesh.
+Concurrent host geometry pools share one finalization/save operation, preserving
+the original host-path baseline. Geometry serialization yields in short batches.
 Geometry, UVs, coverage, depth bias and tile-border clipping survive the handoff
 and reopening, even if the drawing Guide is no longer available for raycasts.
 For a Guide tile, texture updates keep its already chosen surface instead of
