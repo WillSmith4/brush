@@ -52,6 +52,24 @@ input. It does not approximate the preset by repeating a single cached tip.
 Updates remain asynchronous; complex presets can lag behind the latest Pencil
 position while their full native result is computed.
 
+Injected input now enters a separate preview path before the host builds its
+tube geometry. It keeps the host's cached surface projection, spline, pressure,
+mirroring and material settings, and uses a small constant material template.
+While rendering is busy, only the latest Pencil input waits. The hidden host
+tube and per-vertex adapter metadata are not rebuilt for every input event.
+Ordinary, uninjected tools continue through the original host input path.
+
+The native renderer submits paint jobs on a serial background queue and keeps
+up to four compatible preview strokes open. It appends points only when the
+previous points, raster coordinates, dimensions, brush settings and backdrop
+are identical. Changed projections or revised spline samples require replay;
+this intentionally preserves appearance instead of reusing incompatible ink.
+The first live snapshot for a preset is compared with the completed native
+renderer on the device. If its output differs, that preset uses complete renders.
+Pencil-up closes the live sessions. A quiet interval between expensive preview
+requests reserves time for the host render loop and input; completed paint is
+not subject to this preview pacing.
+
 Feather densifies spline positions without densifying its source normals. The
 adapter resamples those normals before building live paint, preventing undefined
 values from aborting preview. For strokes contacting a curved Guide, paint uses
@@ -98,7 +116,7 @@ Run the JavaScript contracts with `npm ci --ignore-scripts && npm test`.
 Device compilation and static binary inspection are separate gates. A successful
 dependency build alone does not verify the renderer or demonstrate operation on
 an iPad. The revised native engine compiled successfully in Actions run
-40975781948. Windows tests use a native-response fixture; the device library
+41266658745. Windows tests use a native-response fixture; the device library
 cannot execute there. Actual brush appearance and mixing need an iPad run.
 
 The host-specific binary and frontend packaging are performed locally. Original

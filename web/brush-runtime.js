@@ -18,6 +18,8 @@
   }
   function newPaintOrder(id){return paintOrder(id,Math.max(Date.now()*1000,lastPaintOrder+1));}
   let renderTail = Promise.resolve(), textureBytes = 0;
+  let nextPreviewSession=0, previewReadyAt=0;
+  const inputPreviews=new WeakMap();
   const MAX_TEXTURE_BYTES = 64 * 1024 * 1024;
   const post = body => root.webkit.messageHandlers.FeatherKrita.postMessage(body);
   const clone = value => JSON.parse(JSON.stringify(value));
@@ -406,11 +408,22 @@
     }
   }
   const rendering=new WeakMap();
+  function closePreview(cache){
+    if(!cache.session||!cache.sessionOpened)return;
+    const body={command:"render",preset:cache.preset,previewSession:cache.session,previewEnd:true};cache.sessionOpened=false;
+    const closing=renderTail.then(()=>checked(body));renderTail=closing.catch(fail);
+  }
   async function renderRecord(id,record,active=()=>true,previewCache=null) {
     if(record.result)return record;
     if(rendering.has(record))return rendering.get(record);
     const job=renderTail.then(async()=>{
       if(!active())return null;
+      // Rendering a growing prefix must not saturate the app indefinitely.
+      // Leave a bounded quiet interval for the host render loop and Pencil.
+      if(record.preview)while(now()<previewReadyAt){
+        if(!active())return null;
+        await new Promise(resolve=>setTimeout(resolve,Math.min(16,previewReadyAt-now())));
+      }
       const meta={...await presetInfo(record.preset)};
       if(meta.engine==="mypaintbrush")meta.samplesBackdrop=true;
       if(!active())return null;
@@ -424,7 +437,13 @@
         const captured=snapshot(request.frame);request.body.backdrop=captured.png;record.surface={encoding:"linear-camera-v3",depth:captured.depth,near:captured.near,far:captured.far,distance:captured.distance};
       }
       const signature=previewCache?JSON.stringify(request.body):null;
-      const result=previewCache?.signature===signature?previewCache.result:await checked(request.body);
+      if(record.preview&&meta.previewSessions&&previewCache){
+        if(!previewCache.session)previewCache.session='preview-'+Date.now()+'-'+(++nextPreviewSession);
+        request.body.previewSession=previewCache.session;previewCache.preset=record.preset;previewCache.sessionOpened=true;
+      }
+      const started=now(),cached=previewCache?.signature===signature;
+      const result=cached?previewCache.result:await checked(request.body);
+      if(record.preview&&!cached)previewReadyAt=now()+Math.max(8,(now()-started)*.5);
       if(!active())return null;
       if(previewCache){previewCache.signature=signature;previewCache.result=result;}
       record.frame=request.frame;record.result=result;
@@ -825,12 +844,77 @@
       return clamp(pressures[j]*(1-(f-j))+(pressures[Math.min(j+1,pressures.length-1)]||0)*(f-j),0,1);
     });
   }
+  function endInputPreview(host){
+    const input=inputPreviews.get(host);if(!input)return;
+    input.generation++;input.latest=null;input.active=false;clearTimeout(input.timer);input.timer=null;
+    for(const mesh of host.getState().meshes)preview(mesh,{});
+    gesture=null;
+  }
+  function inputPreview(host,event){
+    if(!attached||!api.projectPreview||!api.createPreview)return false;
+    const brush=api.currentBrush?.();if(!brush||!(gesture?.bindings||bindings)[brush.shape])return false;
+    if(!gesture)gesture={bindings:{...bindings}};
+    let input=inputPreviews.get(host);
+    if(!input){input={latest:null,running:false,active:false,generation:0,timer:null};inputPreviews.set(host,input);}
+    input.active=true;input.latest=event;
+    const run=async()=>{
+      input.timer=null;if(input.running||!input.latest||!input.active)return;
+      input.running=true;const generation=input.generation,active=()=>input.active&&generation===input.generation;
+      const event=input.latest;input.latest=null;
+      try{
+        const source=host.getState(),b=api.currentBrush(),pointers=event.clientPointers;
+        if(!api.previewReady(pointers))return;
+        // Use exactly Feather's surface projection, cached intersections,
+        // spline and mirror transforms, but never build the hidden host tube.
+        const projected=api.projectPreview(pointers,source),mirrors=api.previewMirrors(),pending=[],paths=[];
+        let index=0;
+        for(let part=0;part<projected.splinePointsArray.length;part++){
+          const path=projected.splinePointsArray[part],normals=projected.normalsArray[part];if(path.length<2)continue;
+          const pressures=pressureInput(event.pressures,path.length,b.shape,b.pressureParameter!=="OFF");
+          for(const matrix of mirrors){
+            if(!active())return;
+            if(source.meshes.length<=index)api.createPreview(host);
+            const mesh=source.meshes[index++],geometry=mesh.geometry;
+            const normalMatrix=matrix.clone().transpose().invert();
+            const points=path.map(p=>p.clone().applyMatrix4(matrix)),surfaceNormals=normals.map(n=>n.clone().applyMatrix4(normalMatrix));
+            paths.push(points);
+            if(!geometry.drawRange.count)mesh.material=api.previewMaterial();
+            // The replacement geometry supplies positions/normals/color itself;
+            // only constant host material attributes need a four-vertex source.
+            for(let i=0;i<4;i++){geometry.attributes.position.setXYZ(i,points[0].x,points[0].y,points[0].z);geometry.attributes.color.setXYZW(i,b.color[0],b.color[1],b.color[2],Math.round(b.opacity*255));}
+            const style=b.materialStyle;
+            const set=(name,values,Type=Float32Array)=>{
+              let a=geometry.attributes[name];if(!a){a=new api.Attribute(new Type(4*values.length),values.length);geometry.setAttribute(name,a);}
+              for(let i=0;i<4;i++)a.array.set(values,i*values.length);a.needsUpdate=true;
+            };
+            if((style.type==="SHADED"||style.type==="FLAT")&&style.pattern!=="NONE")set("properties",[style.density,style.rotation,style.contrast]);
+            mesh.castShadow=mesh.receiveShadow=style.type==="SHADED"&&!!api.previewShading();
+            if(mesh.castShadow){set("normalUp",[0,0,1]);set("normalSide",[0,0,1]);set("upDown",[0],Uint8Array);}
+            if(style.type==="GLOW"&&api.previewShading())set("intensity",[(style.intensity||0)*255],Uint16Array);
+            geometry.index.array.set([0,2,1,0,3,2]);geometry.index.needsUpdate=true;geometry.setDrawRange(0,6);
+            geometry.attributes.position.needsUpdate=true;geometry.attributes.color.needsUpdate=true;
+            pending.push(preview(mesh,{shape:b.shape,color:[...b.color,b.opacity],size:b.size,materialStyle:style,points,normals:surfaceNormals,pressures,sourceTemplate:true}));
+          }
+        }
+        const ongoing=gesture;
+        for(let i=index;i<source.meshes.length;i++){source.meshes[i].geometry.setDrawRange(0,0);preview(source.meshes[i],{});}
+        gesture=ongoing;
+        if(paths.length)api.notifyPreview(host,paths);
+        await Promise.all(pending);
+      }catch(error){if(active())fail(error);}finally{
+        input.running=false;if(input.active&&input.latest)input.timer=setTimeout(run,0);
+      }
+    };
+    // At most one latest input snapshot waits while native paint is busy.
+    if(!input.running&&input.timer===null)input.timer=setTimeout(run,0);
+    return true;
+  }
   function preview(mesh,attributes) {
     if(!attached||!mesh?.parent)return;
     let holder=previews.get(mesh);
     const stop=!mesh.geometry.drawRange.count||!attributes.shape;
     if(stop){
-      if(holder){holder.epoch++;clearTimeout(holder.timer);holder.timer=null;holder.latest=null;holder.signature=null;holder.cache={};clearState(states.get(holder.manager));holder.manager.curveIdToGeomInfo.clear();}
+      if(holder){holder.epoch++;clearTimeout(holder.timer);holder.timer=null;holder.latest=null;holder.signature=null;closePreview(holder.cache);holder.cache={};clearState(states.get(holder.manager));holder.manager.curveIdToGeomInfo.clear();}
       gesture=null;return;
     }
     if(!gesture)gesture={bindings:{...bindings}};
@@ -838,7 +922,7 @@
     if(!holder){
       const manager={sceneGroup:mesh.parent,curveIdToGeomInfo:new Map(),getGeomFromInfo:()=>({geometry:mesh.geometry,mesh})};
       holder={manager,timer:null,latest:null,epoch:0,running:false,disposed:false,signature:null,cache:{}};previews.set(mesh,holder);register(manager);
-      mesh.addEventListener("removed",()=>{holder.disposed=true;holder.epoch++;holder.latest=null;holder.cache={};holder.signature=null;clearTimeout(holder.timer);clearState(states.get(manager));managers.delete(manager);});
+      mesh.addEventListener("removed",()=>{holder.disposed=true;holder.epoch++;holder.latest=null;closePreview(holder.cache);holder.cache={};holder.signature=null;clearTimeout(holder.timer);clearState(states.get(manager));managers.delete(manager);});
     }
     const count=attributes.points?.length || 0;
     if(count<2)return;
@@ -862,10 +946,11 @@
         // raster frame; the renderer handles their interpolation for geometry.
         if(a.renderNormals?.length)a.normals=a.renderNormals;
         delete a.renderNormals;
+        const sourceTemplate=a.sourceTemplate;delete a.sourceTemplate;
         const record={version:2,preset:latest.preset,preview:true,attributes:a};
         const rendered=await renderRecord(null,record,active,holder.cache);
         if(!rendered||!active())return;
-        const info={attributes:a,numOfPoints:a.points.length,geomAttributes:0,geomIndex:0,fkIndexCount:latest.indexCount};
+        const info={attributes:a,numOfPoints:sourceTemplate?1:a.points.length,geomAttributes:0,geomIndex:0,fkIndexCount:latest.indexCount};
         if(!record.surface?.depth){
           record.guideSurface=guideSurface(record.frame,a);
         }
@@ -879,10 +964,11 @@
         if(holder.latest&&!holder.disposed)holder.timer=setTimeout(run,0);
       }
     };
-    if(!holder.running)void run();
+    if(!holder.running){holder.work=run();return holder.work;}
+    return holder.work;
   }
   function savePreset(id,shape){post({command:"savePreset",id,shape}).catch(fail);}
   async function selectPreset(id,shape){try{const result=await checked({command:"selectPreset",id,shape});if(result.bindings)setBindings(result.bindings);}catch(error){fail(error);}}
-  root.FeatherKrita={attach,attachSelection,setBindings,preview,pressureInput,normalAt,hover,hoverEnd,birth,inherit,savePreset,selectPreset};
+  root.FeatherKrita={attach,attachSelection,setBindings,inputPreview,endInputPreview,preview,pressureInput,normalAt,hover,hoverEnd,birth,inherit,savePreset,selectPreset};
   if(typeof module!=="undefined")module.exports={strokeRequest,coverageRectangles,mapPixel,surfaceHeight,hoverPositions,normalAt,SHAPES};
 })(globalThis);

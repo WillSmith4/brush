@@ -6,7 +6,7 @@ const runtime=fs.readFileSync(path.join(__dirname,'../web/brush-runtime.js'),'ut
 const clone=o=>JSON.parse(JSON.stringify(o));
 const tick=()=>new Promise(r=>setImmediate(r));
 async function settled(){for(let i=0;i<12;i++)await tick();}
-function fixture(store=new Map(),deferRender,deferOutline){
+function fixture(store=new Map(),deferRender,deferOutline,extraApi={}){
  const requests=[],errors=[];
  class Image {set src(value){Object.assign(this,JSON.parse(Buffer.from(value.split(',')[1],'base64').toString()));}async decode(){}}
  const context={console,setTimeout,clearTimeout,queueMicrotask,Image,CustomEvent:class{},dispatchEvent(){},document:{readyState:'complete',createElement(){
@@ -18,10 +18,11 @@ function fixture(store=new Map(),deferRender,deferOutline){
    if(body.command==='loadStroke')return {ok:true,record:store.has(body.id)?clone(store.get(body.id)):null};
    if(body.command==='presetInfo'){
     if(deferOutline)await deferOutline;
-    return {ok:true,extent:1,samplesBackdrop:false,outline:body.preset==='rect'?[[[-.5,-.25],[.5,-.25],[.5,.25],[-.5,.25]]]:[[[0,-.5],[.5,0],[0,.5],[-.5,0]]]};
+    return {ok:true,extent:1,samplesBackdrop:false,previewSessions:!!extraApi.nativeSessions,outline:body.preset==='rect'?[[[-.5,-.25],[.5,-.25],[.5,.25],[-.5,.25]]]:[[[0,-.5],[.5,0],[0,.5],[-.5,0]]]};
    }
    if(body.command==='selectPreset')return {ok:true,bindings:{RECT:'saved'}};
    if(body.command==='render'){
+    if(body.previewEnd)return {ok:true,closed:true};
     if(deferRender)await deferRender;
     const png=Buffer.from(JSON.stringify({width:body.width,height:body.height,tip:body.preset,input:JSON.stringify(body)})).toString('base64');
     return {ok:true,width:body.width,height:body.height,png,coverage:png,composited:false};
@@ -51,7 +52,7 @@ function fixture(store=new Map(),deferRender,deferOutline){
   timelapse(count){for(const {geometry}of this.geoms.values())geometry.setDrawRange(0,count);}
   getGeomFromInfo(info){return this.geoms.get(info);}
  }
- context.FeatherKrita.attach(Manager,{Geometry:THREE.BufferGeometry,Attribute:THREE.BufferAttribute,Mesh:THREE.Mesh,LineSegments:THREE.LineSegments,Vector3:THREE.Vector3,ShaderMaterial:THREE.ShaderMaterial,Texture:THREE.Texture,LinearFilter:THREE.LinearFilter,fallbackSize:.01});
+ context.FeatherKrita.attach(Manager,{Geometry:THREE.BufferGeometry,Attribute:THREE.BufferAttribute,Mesh:THREE.Mesh,LineSegments:THREE.LineSegments,Vector3:THREE.Vector3,ShaderMaterial:THREE.ShaderMaterial,Texture:THREE.Texture,LinearFilter:THREE.LinearFilter,fallbackSize:.01,...extraApi});
  const attributes={shape:'RECT',size:1,color:[50,100,200,.75],pressures:[.2,.5,1],points:[{x:0,y:0,z:0},{x:1,y:0,z:0},{x:2,y:0,z:0}],normals:[{x:0,y:0,z:1},{x:0,y:0,z:1},{x:0,y:0,z:1}]};
  const manager=new Manager(),fk=context.FeatherKrita;
  function draw(id,a=attributes){fk.birth(id,a);manager.makeCurve(id,a);}
@@ -332,4 +333,37 @@ test('densified live normals use the same native raster frame as raw normals in 
  assert.ok(f.manager.sceneGroup.children.some(m=>m.geometry.attributes.fkUV));
  geometry.setDrawRange(0,0);f.fk.preview(mesh,{});f.draw('finished',final);await settled();
  const requests=f.requests.filter(r=>r.command==='render');assert.equal(requests.length,2);assert.deepEqual(requests[0],requests[1]);assert.deepEqual(f.errors,[]);
+});
+
+test('busy direct preview coalesces thousands of Pencil events without rebuilding the host tube or reprojecting',async()=>{
+ let release;const waiting=new Promise(r=>release=r);let projections=0,notifications=0;
+ const brush={shape:'RECT',size:1,color:[50,100,200],opacity:.75,pressureParameter:'OFF',materialStyle:{type:'FLAT',pattern:'NONE'}};
+ let f;const state={meshes:[],pointsCacheMap:new Map(),normalCacheMap:new Map()},host={getState:()=>state};
+ const extra={nativeSessions:true,currentBrush:()=>brush,previewReady:p=>p.length>1,previewMirrors:()=>[new THREE.Matrix4()],previewShading:()=>false,notifyPreview:()=>notifications++,
+  projectPreview(points){projections++;return {splinePointsArray:[points],normalsArray:[points.map(()=>new THREE.Vector3(0,0,1))]};},
+  createPreview(){const {mesh}=f.manager.makeCurve('template'+state.meshes.length,f.attributes);mesh.geometry.setDrawRange(0,0);state.meshes.push(mesh);},
+  previewMaterial:()=>new THREE.ShaderMaterial({vertexShader:'void main(){gl_Position=vec4(position,1.0);}',fragmentShader:'varying vec4 vColor;void main(){vec4 diffuseColor = vColor;gl_FragColor=diffuseColor;}'})};
+ f=fixture(new Map(),waiting,null,extra);
+ const points=Array.from({length:6000},(_,i)=>new THREE.Vector3(Math.cos(i*.01),Math.sin(i*.01),0));
+ assert.equal(f.fk.inputPreview(host,{clientPointers:points,pressures:[]}),false);assert.equal(projections,0);
+ f.fk.setBindings({RECT:'rect'});f.fk.inputPreview(host,{clientPointers:points.slice(0,3),pressures:[]});
+ for(let i=0;i<200&&!f.requests.some(r=>r.command==='render');i++)await new Promise(r=>setTimeout(r,5));
+ assert.equal(projections,1);
+ for(let i=0;i<2000;i++)f.fk.inputPreview(host,{clientPointers:points,pressures:[]});
+ assert.equal(projections,1);assert.equal(f.requests.filter(r=>r.command==='render').length,1);
+ release();
+ for(let i=0;i<600&&!f.requests.some(r=>r.points?.length===4096);i++)await new Promise(r=>setTimeout(r,5));
+ assert.equal(projections,2);assert.equal(notifications,2);
+ const renders=f.requests.filter(r=>r.command==='render'&&!r.previewEnd);assert.equal(renders.length,2);assert.equal(renders[0].previewSession,renders[1].previewSession);
+ f.fk.endInputPreview(host);await new Promise(r=>setTimeout(r,150));
+ assert.ok(f.requests.some(r=>r.previewEnd&&r.previewSession===renders[0].previewSession));
+ assert.ok(!f.manager.sceneGroup.children.some(m=>m.geometry.attributes.fkUV));assert.deepEqual(f.errors,[]);
+});
+
+test('ending direct input before its scheduled work drops it and keeps original brushes untouched',async()=>{
+ let projections=0;const state={meshes:[]},host={getState:()=>state};
+ const brush={shape:'RECT'};const f=fixture(new Map(),null,null,{currentBrush:()=>brush,projectPreview(){projections++;throw Error('Cancelled work ran');},createPreview(){},previewReady:()=>true});
+ f.fk.setBindings({RECT:'rect'});assert.equal(f.fk.inputPreview(host,{clientPointers:[],pressures:[]}),true);f.fk.endInputPreview(host);
+ await new Promise(r=>setTimeout(r,25));assert.equal(projections,0);assert.deepEqual(f.errors,[]);
+ f.fk.setBindings({});assert.equal(f.fk.inputPreview(host,{clientPointers:[],pressures:[]}),false);assert.equal(projections,0);
 });
