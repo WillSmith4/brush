@@ -66,7 +66,7 @@ QJsonObject renderStream(RenderJob &job,const QJsonObject &request) {
     }
     // Delayed dirty tiles need the complete current indirect layer, not just
     // this batch's dirty region. Snapshot those tiles while the painter is idle.
-    if(job.layer->hasTemporaryTarget())streamBarrier(job,[&]{KisIndirectPaintingSupport::ReadLocker lock(job.layer.data());KisPainter painter(device);job.layer->setupTemporaryPainter(&painter);for(const auto key:job.pendingTiles){const QRect r(int(key>>32)-1,int(quint32(key))-1,258,258);painter.bitBlt(r.topLeft(),job.layer->temporaryTarget(),r);}});
+    if(job.layer->hasTemporaryTarget())streamBarrier(job,[&]{KisIndirectPaintingSupport::ReadLocker lock(job.layer.data());KisPainter painter(device);job.layer->setupTemporaryPainter(&painter);QRegion region;for(const auto key:job.pendingTiles)region+=QRect(int(key>>32)-1,int(quint32(key))-1,258,258);for(const auto &r:region)painter.bitBlt(r.topLeft(),job.layer->temporaryTarget(),r);});
     QByteArray packet;QJsonArray tiles;
     const auto keys=job.pendingTiles.values();int count=0;
     for(const auto key:keys){if(count++==16)break;const int x=int(key>>32),y=int(quint32(key));const QRect rect(x-1,y-1,258,258);QImage color,coverage;streamImages(job,device,rect,color,coverage);const int offset=packet.size();const QImage rgba=color.convertToFormat(QImage::Format_RGBA8888);

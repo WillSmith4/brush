@@ -332,7 +332,7 @@ std::shared_ptr<RenderJob> prepareRender(const QJsonObject &request) {
     job->width = width; job->height = height;
     job->resources = resources; job->points = points; job->settings = request;
     job->streaming = stream;
-    if (stream) job->base = new KisPaintDevice(space);
+    if (stream) { job->base = new KisPaintDevice(space); static_cast<StreamLayer*>(layer.data())->takeDirty(); }
     return job;
 }
 
@@ -524,7 +524,7 @@ extern "C" void FKRenderAsync(const char *json, FKRenderCompletion completion, v
                 require(pending->live,"Missing live stroke identifier.");
                 if(request["streamBegin"].toBool()){
                     require(!previous,"The live stroke already exists.");pending->job=prepareRender(request);
-                    require(previewSessions.size()<4,"Too many simultaneous live strokes.");previewSessions.insert(pending->session,pending->job);
+                    require(previewSessions.size()<32,"Too many simultaneous live strokes.");previewSessions.insert(pending->session,pending->job);
                 }else{require(previous&&previous->streaming&&previous->settings["preset"]==request["preset"],"Unknown live stroke.");pending->job=previous;}
             } else {
             if (verifiedSessionPresets.contains(pending->preset) && !verifiedSessionPresets[pending->preset]) pending->live = false;
