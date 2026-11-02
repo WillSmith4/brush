@@ -70,7 +70,7 @@ does not run PNG compression, base64 encoding, image decode or canvas readback.
 Pencil-up finishes the same native paint session, but displayed artwork retains
 the exact live tiles and their captured surface geometry. Tiles are stored as
 immutable records in `StrokeTiles-v1`; the existing stroke record contains their
-IDs and the legacy baked PNG fallback. Rendering uses the tiles, so a large
+IDs; earlier records may also contain a legacy baked PNG fallback. Rendering uses the tiles, so a large
 stroke is not visibly replaced by a resampled whole-stroke raster. Existing
 documents and already painted strokes are not rerendered.
 
@@ -83,12 +83,29 @@ The reusable Pencil mesh is released at handoff, and finished paint reads
 uniforms from its document curve instead of the next gesture's preview mesh.
 Concurrent host geometry pools share one finalization/save operation, preserving
 the original host-path baseline. Geometry serialization yields in short batches.
+The host's final curve carries the live path/mirror slot explicitly: adjusting
+its first point no longer makes the adapter miss the existing native session.
+Native tiles arriving after Pencil-up are retained by the claimed curve rather
+than dropped with the old input generation. Current engines close tiled strokes
+without assembling, resizing or PNG-encoding another whole-stroke image.
 Geometry, UVs, coverage, depth bias and tile-border clipping survive the handoff
 and reopening, even if the drawing Guide is no longer available for raycasts.
 For a Guide tile, texture updates keep its already chosen surface instead of
 reselecting a support during finalization. Copies share immutable tile files;
 transforms/visibility continue through the host curve. Stroke history retains
 these files just like the existing per-stroke sidecars.
+
+Document curve removal invalidates pending work and removes all tagged paint
+instances immediately, before geometry-pool compaction. Redo releases that
+invalidation through the matching document-added event. Live and saved paint
+take linear depth near/far from the camera used for the actual draw, without
+modifying host materials; this matches Guide depth when camera bounds change.
+Surface draw ranges align to individual triangles, not pairs of triangles;
+otherwise an odd-sized Guide patch loses its last face. The explicit linear
+depth bias includes the rasterized surface slope, matching the slope component
+that fixed-function polygon offset cannot supply when gl_FragDepth is written.
+This separates steep paint faces from Guide wire edges. Both bias components
+are disabled when capturing depth for smudge; opaque occlusion remains tested.
 
 Earlier prefix-render APIs remain available to older adapters. Current drawing
 uses explicit sequence numbers and new samples, so changing stroke bounds cannot
@@ -146,7 +163,7 @@ Run the JavaScript contracts with `npm ci --ignore-scripts && npm test`.
 Device compilation and static binary inspection are separate gates. A successful
 dependency build alone does not verify the renderer or demonstrate operation on
 an iPad. The revised native engine compiled successfully in Actions run
-41273639724 (streaming engine). Run 41270803291 supplied the intermediate raw
+41339408450 (tile-only finish; streaming base from run 41273639724). Run 41270803291 supplied the intermediate raw
 transport implementation and was not delivered as the real-time fix.
 Windows tests use a native-response fixture; the device library
 cannot execute there. Actual brush appearance and mixing need an iPad run.

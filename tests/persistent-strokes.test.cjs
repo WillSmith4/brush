@@ -20,7 +20,7 @@ function fixture(store=new Map(),deferRender,deferOutline,extraApi={}){
    if(body.command==='loadStrokeTile')return {ok:true,record:clone(store.get('tile/'+body.id)||null)};
    if(body.command==='presetInfo'){
     if(deferOutline)await deferOutline;
-    return {ok:true,extent:1,samplesBackdrop:false,strokeStreaming:extraApi.nativeStreaming?1:undefined,previewPixels:!!extraApi.nativePixels,previewSessions:!!extraApi.nativeSessions,outline:body.preset==='rect'?[[[-.5,-.25],[.5,-.25],[.5,.25],[-.5,.25]]]:[[[0,-.5],[.5,0],[0,.5],[-.5,0]]]};
+    return {ok:true,extent:1,samplesBackdrop:false,streamTilesOnly:!!extraApi.tilesOnly,strokeStreaming:extraApi.nativeStreaming?1:undefined,previewPixels:!!extraApi.nativePixels,previewSessions:!!extraApi.nativeSessions,outline:body.preset==='rect'?[[[-.5,-.25],[.5,-.25],[.5,.25],[-.5,.25]]]:[[[0,-.5],[.5,0],[0,.5],[-.5,0]]]};
    }
    if(body.command==='selectPreset')return {ok:true,bindings:{RECT:'saved'}};
    if(body.command==='render'){
@@ -31,7 +31,7 @@ function fixture(store=new Map(),deferRender,deferOutline,extraApi={}){
      const state=streams.get(body.previewSession);assert.ok(state);assert.equal(body.streamFrom,state.count);assert.ok(body.points.length<=64);
      state.count+=body.points.length;state.points.push(...body.points);
      const x=Math.floor(state.points[0][0]/256)*256,y=Math.floor(state.points[0][1]/256)*256;
-     if(body.streamFinish){const png=Buffer.from(JSON.stringify({width:256,height:256,tip:'rect'})).toString('base64');streams.delete(body.previewSession);return {ok:true,width:256,height:256,png,coverage:png,composited:false,streamCount:state.count,streamX:x,streamY:y,streamScale:1};}
+     if(body.streamFinish){const png=body.streamTilesOnly?undefined:Buffer.from(JSON.stringify({width:256,height:256,tip:'rect'})).toString('base64');streams.delete(body.previewSession);return {ok:true,width:256,height:256,png,coverage:png,composited:false,streamCount:state.count,streamX:x,streamY:y,streamScale:1,tilesOnly:!!body.streamTilesOnly};}
      if(extraApi.quietStreaming)return {ok:true,tiles:[],pixels:'',streamCount:state.count,pendingTiles:false,composited:false};
      const token='00000000-0000-4000-8000-'+String(++pixelSequence).padStart(12,'0')+'.rgba',n=258*258,bytes=new Uint8Array(n*5);for(let i=0;i<n;i++)bytes.set([50,100,200,255],i*4);bytes.fill(255,n*4);pixelPackets.set(token,bytes);
      return {ok:true,tiles:[{x:x-1,y:y-1,width:258,height:258,offset:0}],pixels:token,streamCount:state.count,pendingTiles:false,composited:false};
@@ -512,4 +512,48 @@ test('two host geometry pools finalize a live record once and preserve the origi
  for(let i=0;i<400&&!second.sceneGroup.children.some(m=>m.children.some(c=>c.geometry?.attributes.fkUV));i++)await new Promise(r=>setTimeout(r,5));
  const record=f.store.get('shared');assert.ok(record?.result?.tiles);assert.deepEqual(record.hostAttributes.points,final.points);
  assert.equal(f.requests.filter(r=>r.command==='saveStroke'&&r.id==='shared').length,2);assert.equal(f.requests.filter(r=>r.streamFinish).length,1);assert.deepEqual(f.errors,[]);
+});
+
+test('document removal immediately drops every painted instance before host pool compaction',async()=>{
+ let removed=()=>{},added=()=>{},f;f=fixture(new Map(),null,null,{nativeStreaming:true,observeCurves:(r,a)=>{removed=r;added=a;},scene:()=>f.manager.sceneGroup});
+ f.manager.makeCurve('live',f.attributes);await settled();const {mesh}=f.manager.getGeomFromInfo(f.manager.curveIdToGeomInfo.get('live'));mesh.geometry.setDrawRange(0,6);f.fk.setBindings({RECT:'rect'});await f.fk.preview(mesh,{...f.attributes,sourceTemplate:true});
+ f.fk.birth('remove-event',f.attributes);mesh.geometry.setDrawRange(0,0);f.fk.preview(mesh,{});f.manager.makeCurve('remove-event',f.attributes);
+ for(let i=0;i<300&&!f.store.get('remove-event')?.result?.tiles;i++)await new Promise(r=>setTimeout(r,5));await settled();
+ const second=new f.manager.constructor();second.makeCurve('remove-event',f.attributes);for(let i=0;i<300&&!second.sceneGroup.children.some(m=>m.children.some(c=>c.geometry?.attributes.fkUV));i++)await new Promise(r=>setTimeout(r,5));
+ removed(['remove-event']);f.manager.makeCurves();second.makeCurves();await settled();
+ for(const group of [f.manager.sceneGroup,second.sceneGroup]){let ink=false;group.traverse(m=>{ink||=!!m.geometry?.attributes.fkUV;});assert.equal(ink,false);}
+ assert.ok(f.manager.curveIdToGeomInfo.has('remove-event'),'host has not compacted yet');
+ added(['remove-event']);for(let i=0;i<300&&!f.manager.sceneGroup.children.some(m=>m.children.some(c=>c.geometry?.attributes.fkUV));i++)await new Promise(r=>setTimeout(r,5));assert.ok(f.manager.sceneGroup.children.some(m=>m.children.some(c=>c.geometry?.attributes.fkUV)));assert.deepEqual(f.errors,[]);
+});
+
+test('live and finished paint use the rendering camera depth range without mutating host materials',async()=>{
+ const f=fixture(new Map(),null,null,{renderRange:c=>c&&({near:c.near,far:c.far})});f.manager.makeCurve('live',f.attributes);await settled();const {mesh}=f.manager.getGeomFromInfo(f.manager.curveIdToGeomInfo.get('live'));
+ mesh.geometry.setDrawRange(0,60);mesh.material.uniforms.near={value:.01};mesh.material.uniforms.far={value:1000};f.fk.setBindings({RECT:'rect'});await f.fk.preview(mesh,f.attributes);
+ const live=f.manager.sceneGroup.children.find(m=>m.geometry?.attributes.fkUV);assert.ok(live);live.onBeforeRender(null,null,{near:.5,far:9});assert.equal(live.material.uniforms.near.value,.5);assert.equal(live.material.uniforms.far.value,9);assert.equal(mesh.material.uniforms.far.value,1000);
+ live.onBeforeRender(null,null,{near:1,far:80});assert.equal(live.material.uniforms.near.value,1);assert.equal(live.material.uniforms.far.value,80);mesh.geometry.setDrawRange(0,0);f.fk.preview(mesh,{});assert.deepEqual(f.errors,[]);
+});
+
+test('tile-aware engines close a stroke without requesting a redundant whole-stroke PNG',async()=>{
+ const f=fixture(new Map(),null,null,{nativeStreaming:true,tilesOnly:true});f.manager.makeCurve('live',f.attributes);await settled();const {mesh}=f.manager.getGeomFromInfo(f.manager.curveIdToGeomInfo.get('live'));mesh.geometry.setDrawRange(0,6);f.fk.setBindings({RECT:'rect'});await f.fk.preview(mesh,{...f.attributes,sourceTemplate:true});
+ f.fk.birth('tiles-only',f.attributes);mesh.geometry.setDrawRange(0,0);f.fk.preview(mesh,{});f.manager.makeCurve('tiles-only',f.attributes);
+ for(let i=0;i<300&&!f.store.get('tiles-only')?.result?.tiles;i++)await new Promise(r=>setTimeout(r,5));
+ assert.ok(f.requests.some(r=>r.streamFinish&&r.streamTilesOnly));const record=f.store.get('tiles-only');assert.ok(record.result.tiles.length);assert.equal(record.result.png,undefined);assert.deepEqual(f.errors,[]);
+});
+
+test('Pencil-up claims the same stroke slot even if the host adjusts its first point',async()=>{
+ const f=fixture(new Map(),null,null,{nativeStreaming:true,tilesOnly:true});f.manager.makeCurve('live',f.attributes);await settled();const {mesh}=f.manager.getGeomFromInfo(f.manager.curveIdToGeomInfo.get('live'));mesh.geometry.setDrawRange(0,6);f.fk.setBindings({RECT:'rect'});
+ await f.fk.preview(mesh,{...f.attributes,sourceTemplate:true,strokeSlot:'0:0'});
+ const adjusted={...f.attributes,points:f.attributes.points.map(p=>({...p,y:p.y+.4}))};
+ f.fk.birth('adjusted',adjusted,'0:0');mesh.geometry.setDrawRange(0,0);f.fk.preview(mesh,{});f.manager.makeCurve('adjusted',adjusted);
+ for(let i=0;i<400&&!f.store.get('adjusted')?.result;i++)await new Promise(r=>setTimeout(r,5));
+ assert.ok(f.store.get('adjusted')?.result?.tiles?.length);assert.equal(f.requests.filter(r=>r.streamBegin).length,1);assert.equal(f.requests.filter(r=>r.streamFinish).length,1);
+ assert.ok(!f.requests.some(r=>r.command==='render'&&r.streamFrom===undefined&&!r.previewEnd));assert.deepEqual(f.errors,[]);
+});
+
+test('a native tile returned after Pencil-up is retained by the claimed document stroke',async()=>{
+ let release;const gate=new Promise(r=>release=r),f=fixture(new Map(),gate,null,{nativeStreaming:true,tilesOnly:true});f.manager.makeCurve('live',f.attributes);await settled();const {mesh}=f.manager.getGeomFromInfo(f.manager.curveIdToGeomInfo.get('live'));mesh.geometry.setDrawRange(0,6);f.fk.setBindings({RECT:'rect'});
+ const drawing=f.fk.preview(mesh,{...f.attributes,sourceTemplate:true,strokeSlot:'0:0'});for(let i=0;i<200&&!f.requests.some(r=>r.streamBegin);i++)await new Promise(r=>setTimeout(r,5));
+ f.fk.birth('late-tile',f.attributes,'0:0');mesh.geometry.setDrawRange(0,0);f.fk.preview(mesh,{});f.manager.makeCurve('late-tile',f.attributes);release();await drawing;
+ for(let i=0;i<400&&!f.store.get('late-tile')?.result;i++)await new Promise(r=>setTimeout(r,5));
+ assert.ok(f.store.get('late-tile')?.result?.tiles?.length);assert.equal(f.pixelPackets.size,0);assert.equal(f.requests.filter(r=>r.streamBegin).length,1);assert.deepEqual(f.errors,[]);
 });

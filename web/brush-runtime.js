@@ -22,6 +22,7 @@
   const inputPreviews=new WeakMap();
   const liveRecords=new WeakMap();
   const retainedStrokes=new WeakMap();
+  const removedCurves=new Set(),claimedStreams=new Map();
   function sameHostPath(a,b){return a.size===b.size&&a.shape===b.shape&&a.points?.length===b.points?.length&&a.points.every((p,i)=>xyz(p).every((v,k)=>v===xyz(b.points[i])[k]));}
   const MAX_TEXTURE_BYTES = 64 * 1024 * 1024;
   const post = body => root.webkit.messageHandlers.FeatherKrita.postMessage(body);
@@ -300,13 +301,16 @@
   }
 
   function save(id,record){return checked({command:"saveStroke",id,record});}
-  function birth(id,attributes) {
+  function birth(id,attributes,strokeSlot) {
+    removedCurves.delete(id);
     if(artworks.has(id))return;
     const preset=(gesture?.bindings || bindings)[attributes.shape];
     if(!preset){artworks.set(id,Promise.resolve(null));return;}
     const record={version:2,preset,paintOrder:newPaintOrder(id),attributes:clone(attributes)};
-    const stream=gesture?.streams?.find(s=>!s.claimed&&s.preset===preset&&s.basis&&Math.hypot(...sub(xyz(attributes.points[0]),s.basis.origin))<Math.max(attributes.size*.1,.0001));
-    if(stream){stream.claimed=true;stream.finishAttributes=clone(attributes);retainStream(stream);liveRecords.set(record,stream);}
+    const stream=strokeSlot!==undefined
+      ?gesture?.streams?.find(s=>!s.claimed&&s.preset===preset&&s.strokeSlot===strokeSlot)
+      :gesture?.streams?.find(s=>!s.claimed&&s.preset===preset&&s.basis&&Math.hypot(...sub(xyz(attributes.points[0]),s.basis.origin))<Math.max(attributes.size*.1,.0001));
+    if(stream){stream.claimed=true;stream.curveId=id;claimedStreams.set(id,stream);stream.finishAttributes=clone(attributes);retainStream(stream);liveRecords.set(record,stream);}
     artworks.set(id,Promise.resolve(record));save(id,record).catch(fail);
   }
   function artwork(id) {
@@ -472,6 +476,7 @@
       await replaceCurve(s.holder.manager,state,id,info,record,entry,a,active);
       if(state.records.has(id)){state.records.get(id).streamGuide=!!record.guideSurface;state.records.get(id).tileRecord=record;}
       const mesh=state.records.get(id)?.mesh;if(mesh){mesh.material.uniforms.fkTileClip={value:[1/258,1/258,257/258,257/258]};if(!mesh.material.userData.fkTileClip){mesh.material.fragmentShader='uniform vec4 fkTileClip;\n'+mesh.material.fragmentShader.replace('vec4 fkSample =','if(any(lessThan(fkTexCoord,fkTileClip.xy))||any(greaterThanEqual(fkTexCoord,fkTileClip.zw))) discard;\nvec4 fkSample =');mesh.material.userData.fkTileClip=true;mesh.material.needsUpdate=true;}}
+      if(mesh&&s.curveId)mesh.userData.fkCurveId=s.curveId;
       s.owner?.syncVisibility();
     }
   }
@@ -492,7 +497,7 @@
       const tile={frame:{...r.frame,points:[],normals:[],projected:[]},guideSurface:patch,clip:[1/258,1/258,257/258,257/258],result:{width:r.result.width,height:r.result.height,composited:r.result.composited,rawPixels:root.btoa(binary)}};
       await checked({command:'saveStrokeTile',id,record:tile});tiles.push({id});
     }
-    if(tiles.length){output.result={...result,tiles};return output;}
+    if(tiles.length||result.tilesOnly){output.result={...result,tiles};return output;}
     if(s.meta.samplesBackdrop&&s.backdrops.size){
       const canvas=document.createElement('canvas');canvas.width=result.width;canvas.height=result.height;const ctx=canvas.getContext('2d');ctx.imageSmoothingEnabled=false;
       let first;
@@ -526,14 +531,15 @@
       const body={command:'render',preset:s.preset,previewSession:s.id,streamFrom:s.sent,points:batch,streamTiles:await streamBackground(s,batch)};
       if(!s.started)Object.assign(body,{streamBegin:true,width:16384,height:16384,size:128,color:s.attributes.color.slice(0,3),opacity:s.attributes.color[3]??1,seed:1,streamBackdrop:!!s.meta.samplesBackdrop});
       const result=await nativeSerial(body);s.started=true;s.sent=result.streamCount;
-      await showStreamTiles(s,result,active);
-      while(result.pendingTiles&&active()){
-        const drained=await nativeSerial({command:'render',preset:s.preset,previewSession:s.id,streamFrom:s.sent,points:[]});await showStreamTiles(s,drained,active);result.pendingTiles=drained.pendingTiles;
+      const keepResult=()=>active()||(s.claimed&&!s.released);
+      await showStreamTiles(s,result,keepResult);
+      while(result.pendingTiles&&keepResult()){
+        const drained=await nativeSerial({command:'render',preset:s.preset,previewSession:s.id,streamFrom:s.sent,points:[]});await showStreamTiles(s,drained,keepResult);result.pendingTiles=drained.pendingTiles;
       }
       if(!finish&&!active())return;
     }
     if(finish){
-      const result=await nativeSerial({command:'render',preset:s.preset,previewSession:s.id,streamFrom:s.sent,points:[],streamFinish:true});s.ended=true;
+      const result=await nativeSerial({command:'render',preset:s.preset,previewSession:s.id,streamFrom:s.sent,points:[],streamFinish:true,streamTilesOnly:!!s.meta.streamTilesOnly});s.ended=true;
       return streamedResult(s,result);
     }
   }
@@ -542,8 +548,8 @@
   }
   async function liveStroke(holder,attributes,preset,meta,active){
     let s=holder.stream;
-    if(!s){s={holder,preset,meta:{...meta,samplesBackdrop:meta.samplesBackdrop||meta.engine==='mypaintbrush'},id:'stroke-'+Date.now()+'-'+(++nextPreviewSession),sent:0,started:false,ended:false,worldPoints:[],worldNormals:[],nativePoints:[],pointCells:new Map(),backdrops:new Map(),tail:Promise.resolve()};holder.stream=s;(gesture.streams??=[]).push(s);}
-    s.latest=clone(attributes);delete s.latest.sourceTemplate;
+    if(!s){s={holder,preset,strokeSlot:attributes.strokeSlot,meta:{...meta,samplesBackdrop:meta.samplesBackdrop||meta.engine==='mypaintbrush'},id:'stroke-'+Date.now()+'-'+(++nextPreviewSession),sent:0,started:false,ended:false,worldPoints:[],worldNormals:[],nativePoints:[],pointCells:new Map(),backdrops:new Map(),tail:Promise.resolve()};holder.stream=s;(gesture.streams??=[]).push(s);}
+    s.latest=clone(attributes);delete s.latest.sourceTemplate;delete s.latest.strokeSlot;
     const job=s.tail.then(()=>appendStream(s,s.latest,false,active));s.tail=job.catch(()=>{});await job;
   }
   function closePreview(cache){
@@ -561,7 +567,7 @@
         if(!s.owner)retainedStrokes.set(record,s);
         if(id)await save(id,record);liveRecords.delete(record);return record;
       })();rendering.set(record,job);
-      try{return await job;}finally{rendering.delete(record);s.saved=true;if(s.owner?.detached)releaseRetained(s);}
+      try{return await job;}finally{rendering.delete(record);s.saved=true;if(s.owner?.detached)releaseRetained(s);if(claimedStreams.get(id)===s)claimedStreams.delete(id);}
     }
     const job=renderTail.then(async()=>{
       if(!active())return null;
@@ -726,7 +732,7 @@
     // cannot reliably separate paint from its drawing surface. Apply a small
     // world-space bias in the same linear depth convention as the host.
     if(material.fragmentShader.includes("gl_FragDepth = vDepth;")){
-      material.fragmentShader="uniform float fkDepthBias;\nuniform float near;\nuniform float far;\n"+material.fragmentShader.replace("gl_FragDepth = vDepth;","gl_FragDepth = max(0.0, vDepth - fkDepthBias / max(far - near, 0.000001));");
+      material.fragmentShader="uniform float fkDepthBias;\nuniform float near;\nuniform float far;\n"+material.fragmentShader.replace("gl_FragDepth = vDepth;","float fkSlopeBias = fkDepthBias > 0.0 ? max(abs(dFdx(vDepth)), abs(dFdy(vDepth))) : 0.0;\ngl_FragDepth = max(0.0, vDepth - fkDepthBias / max(far - near, 0.000001) - fkSlopeBias);");
       material.uniforms.fkDepthBias={value:Math.max(Number(size)||api.fallbackSize,0.00001)*0.005};
     }
     material.uniforms.fkBrush={value:entry.texture};material.uniforms.fkCoverage={value:entry.mask};
@@ -737,8 +743,12 @@
     material.polygonOffset=true;material.polygonOffsetFactor=-1;material.polygonOffsetUnits=-1;
     material.needsUpdate=true;return material;
   }
-  function syncUniforms(original,material) {
+  function syncUniforms(original,material,camera) {
     for(const [name,uniform] of Object.entries(original.uniforms))material.uniforms[name]=uniform;
+    const range=api.renderRange?.(camera);
+    if(range&&Number.isFinite(range.near)&&Number.isFinite(range.far)&&range.far>range.near){
+      for(const name of ['near','far']){const key='fkCamera'+name;const uniform=material.userData[key]||(material.userData[key]={value:range[name]});uniform.value=range[name];material.uniforms[name]=uniform;}
+    }
     material.uniformsNeedUpdate=true;
     const defines=JSON.stringify(original.defines);
     if(defines!==material.userData.fkDefines){material.defines={...original.defines};material.userData.fkDefines=defines;material.needsUpdate=true;}
@@ -885,14 +895,15 @@
     }
     const mesh=reuse?previous.mesh:new api.Mesh(geometry,material);mesh.castShadow=geom.mesh.castShadow;mesh.receiveShadow=geom.mesh.receiveShadow;
     mesh.renderOrder=record.preview?Number.MAX_SAFE_INTEGER-1:paintOrder(id,record.paintOrder);mesh.matrixAutoUpdate=false;mesh.matrix.copy(geom.mesh.matrix);
-    mesh.onBeforeRender=()=>syncUniforms(geom.mesh.material,material);
+    mesh.onBeforeRender=(_renderer,_scene,camera)=>syncUniforms(geom.mesh.material,material,camera);
+    if(!record.preview)mesh.userData.fkCurveId=id;
     const indexCount=info.fkIndexCount??((info.numOfPoints-1)*24+12);
     const syncVisibility=()=>{
       mesh.visible=geom.mesh.visible;mesh.matrix.copy(geom.mesh.matrix);mesh.matrixWorldNeedsUpdate=true;
       const start=geom.geometry.drawRange.start,end=start+geom.geometry.drawRange.count;
       const first=clamp((start-info.geomIndex)/indexCount,0,1),last=clamp((end-info.geomIndex)/indexCount,0,1);
       const used=geometry.userData.fkUsedIndices??geometry.index.count;
-      const begin=Math.floor(first*used/6)*6,finish=Math.floor(last*used/6)*6;
+      const begin=Math.floor(first*used/3)*3,finish=Math.floor(last*used/3)*3;
       geometry.setDrawRange(begin,Math.max(0,finish-begin));
     };
     syncVisibility();if(!reuse)manager.sceneGroup.add(mesh);
@@ -905,7 +916,7 @@
     // Mesh extends the host's Object3D. A scene-only container must not submit
     // a dummy material into Feather's multiple-render-target pass.
     const Object3D=Object.getPrototypeOf(api.Mesh.prototype).constructor;
-    const group=new Object3D(),children={generation:0,pending:new Map(),records:new Map(),hidden:new Map(),dirty:new Set()};group.isGroup=true;group.type='Group';
+    const group=new Object3D(),children={generation:0,pending:new Map(),records:new Map(),hidden:new Map(),dirty:new Set()};group.isGroup=true;group.type='Group';group.userData.fkCurveId=id;
     const tileManager={sceneGroup:group,getGeomFromInfo:()=>source};
     try{
       for(let i=0;i<record.result.tiles.length;i++){
@@ -932,7 +943,7 @@
     const source=manager.getGeomFromInfo(info);if(!source)return null;
     retainStream(s);
     const Object3D=Object.getPrototypeOf(api.Mesh.prototype).constructor;
-    const group=s.owner?.mesh||new Object3D();group.isGroup=true;group.type='Group';group.matrixAutoUpdate=false;
+    const group=s.owner?.mesh||new Object3D();group.isGroup=true;group.type='Group';group.matrixAutoUpdate=false;group.userData.fkCurveId=id;
     const children=states.get(s.holder.manager);
     // The host reuses its Pencil mesh on the next gesture. From this point the
     // document owns the paint; releasing it later must not touch that live mask.
@@ -949,9 +960,10 @@
       const from=clamp((first-info.geomIndex)/total,0,1),to=clamp((last-info.geomIndex)/total,0,1);
       for(const child of children.records.values()){
         const geometry=child.mesh.geometry,count=geometry.userData.fkUsedIndices??geometry.index.count;
-        const start=Math.floor(from*count/6)*6,end=Math.floor(to*count/6)*6;
+        const start=Math.floor(from*count/3)*3,end=Math.floor(to*count/3)*3;
         geometry.setDrawRange(start,Math.max(0,end-start));child.mesh.renderOrder=paintOrder(id,record.paintOrder);
-        child.mesh.onBeforeRender=()=>{const material=manager.getGeomFromInfo(info)?.mesh.material;if(material)syncUniforms(material,child.mesh.material);};
+        child.mesh.userData.fkCurveId=id;
+        child.mesh.onBeforeRender=(_renderer,_scene,camera)=>{const material=manager.getGeomFromInfo(info)?.mesh.material;if(material)syncUniforms(material,child.mesh.material,camera);};
       }
     };
     const owner={mesh:group,children,entry:{refs:1},info,source:source.geometry,syncVisibility,liveStream:s,detached:false};s.owner=owner;
@@ -963,12 +975,13 @@
     for(const id of [...state.records.keys()])if(!manager.curveIdToGeomInfo.has(id))removeReplacement(state,id);
     for(const id of [...state.pending.keys()])if(!manager.curveIdToGeomInfo.has(id))state.pending.delete(id);
     for(const [id,info] of manager.curveIdToGeomInfo){
+      if(removedCurves.has(id)){removeReplacement(state,id);state.pending.delete(id);continue;}
       const previous=state.records.get(id),pending=state.pending.get(id),dirty=state.dirty.has(id);
       if(previous?.info===info&&!dirty){hideCurve(manager,info,state,id);previous.syncVisibility();continue;}
       if(pending?.info===info&&!dirty){if(previous||pending.masked)hideCurve(manager,info,state,id);continue;}
       let attributes=latestAttributes.get(info)||info.attributes;const token={info};state.pending.set(id,token);
       const generation=state.generation;
-      const active=()=>generation===state.generation&&state.pending.get(id)===token&&manager.curveIdToGeomInfo.get(id)===info;
+      const active=()=>!removedCurves.has(id)&&generation===state.generation&&state.pending.get(id)===token&&manager.curveIdToGeomInfo.get(id)===info;
       const saved=info.fkRecord?Promise.resolve(info.fkRecord):artwork(id);
       saved.then(async record=>{
         if(!record||!active())return;
@@ -996,11 +1009,15 @@
   }
   function attach(Manager,constructors) {
     if(attached)return;api=constructors;attached=true;
+    api.observeCurves?.(ids=>removeDocumentPaint(ids),ids=>{
+      const changed=[];for(const id of ids||[])if(removedCurves.delete(id))changed.push(id);
+      if(changed.length)for(const manager of managers){const state=states.get(manager);if(!state)continue;for(const id of changed)if(manager.curveIdToGeomInfo.has(id))state.dirty.add(id);if(state.dirty.size)synchronize(manager);}
+    });
     for(const name of ["makeCurves","makeCurve","updateCurve","copyCurveGeom","removeCurve","removeCurves","clear"]){
       const original=Manager.prototype[name];if(typeof original!=="function")throw new Error("Missing Feather operation: "+name);
       Manager.prototype[name]=function(...args){
         const state=register(this);if(state.depth++===0)unhideState(state);
-        if(name==="makeCurve")state.dirty.add(args[0]);
+        if(name==="makeCurve"){state.dirty.add(args[0]);if(!api.observeCurves)removedCurves.delete(args[0]);}
         if(name==="updateCurve")for(const [id,info]of this.curveIdToGeomInfo)if(info===args[0])state.dirty.add(id);
         if(name==="copyCurveGeom")state.dirty.add(args[0]?.curveId);
         try{const result=original.apply(this,args);
@@ -1013,6 +1030,24 @@
     for(const name of ["turnOnOff","timelapse"]){const original=Manager.prototype[name];if(typeof original!=="function")continue;Manager.prototype[name]=function(...args){const result=original.apply(this,args);for(const r of states.get(this)?.records.values()||[])r.syncVisibility();return result;};}
     const ready=()=>post({command:"ready"}).catch(fail);
     if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",()=>setTimeout(ready,250),{once:true});else setTimeout(ready,250);
+  }
+  function removeDocumentPaint(ids){
+    const targets=new Set(ids||[]);for(const id of targets)removedCurves.add(id);
+    for(const manager of managers){const state=states.get(manager);if(!state)continue;for(const id of targets){state.pending.delete(id);state.dirty.delete(id);removeReplacement(state,id);}}
+    for(const id of targets){
+      const s=claimedStreams.get(id);if(!s||s.owner?.detached)continue;
+      if(s.owner){s.owner.detached=true;s.owner.mesh.removeFromParent();}
+      else{
+        retainStream(s);const Object3D=Object.getPrototypeOf(api.Mesh.prototype).constructor,group=new Object3D();
+        for(const child of states.get(s.holder.manager)?.records.values()||[])group.add(child.mesh);
+        s.holder.manager.sceneGroup=group;s.owner={mesh:group,detached:true,syncVisibility(){}};
+      }
+      if(s.saved)releaseRetained(s);
+    }
+    // Some host pools are removed by document events before their geometry
+    // compaction runs. No tagged copy may keep rendering in that interval.
+    const orphans=[];api.scene?.()?.traverse(o=>{if(targets.has(o.userData?.fkCurveId))orphans.push(o);});for(const o of orphans)o.removeFromParent();
+    api.redraw?.();
   }
   function setBindings(next){
     bindings=Object.fromEntries(Object.entries(next).filter(([shape,id])=>SHAPES.includes(shape)&&typeof id==="string"));
@@ -1122,6 +1157,7 @@
         for(let part=0;part<projected.splinePointsArray.length;part++){
           const path=projected.splinePointsArray[part],normals=projected.normalsArray[part];if(path.length<2)continue;
           const pressures=pressureInput(event.pressures,path.length,b.shape,b.pressureParameter!=="OFF");
+          let mirrorIndex=0;
           for(const matrix of mirrors){
             if(!active())return;
             if(source.meshes.length<=index)api.createPreview(host);
@@ -1144,7 +1180,7 @@
             if(style.type==="GLOW"&&api.previewShading())set("intensity",[(style.intensity||0)*255],Uint16Array);
             geometry.index.array.set([0,2,1,0,3,2]);geometry.index.needsUpdate=true;geometry.setDrawRange(0,6);
             geometry.attributes.position.needsUpdate=true;geometry.attributes.color.needsUpdate=true;
-            pending.push(preview(mesh,{shape:b.shape,color:[...b.color,b.opacity],size:b.size,materialStyle:style,points,normals:surfaceNormals,pressures,sourceTemplate:true}));
+            pending.push(preview(mesh,{shape:b.shape,color:[...b.color,b.opacity],size:b.size,materialStyle:style,points,normals:surfaceNormals,pressures,sourceTemplate:true,strokeSlot:part+':'+mirrorIndex++}));
           }
         }
         const ongoing=gesture;
