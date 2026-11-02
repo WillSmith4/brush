@@ -419,12 +419,17 @@
   const rendering=new WeakMap();
   function nativeSerial(body){const job=renderTail.then(()=>checked(body));renderTail=job.catch(()=>{});return job;}
   function retainStream(s){
-    if(s.retained)return;s.retained=true;
+    if(s.retained)return;
     const original=s.holder.manager.getGeomFromInfo({}),geometry=new api.Geometry();
     for(const [name,a]of Object.entries(original.geometry.attributes))if(name!=='fkHide')geometry.setAttribute(name,new api.Attribute(a.array.slice(0,a.itemSize*4),a.itemSize,a.normalized));
     geometry.setIndex(new api.Attribute(new Uint16Array([0,2,1,0,3,2]),1));geometry.setDrawRange(0,6);
-    const mesh=new api.Mesh(geometry,original.mesh.material.clone());mesh.matrixAutoUpdate=false;mesh.matrix.copy(original.mesh.matrix);mesh.castShadow=original.mesh.castShadow;mesh.receiveShadow=original.mesh.receiveShadow;
-    s.template={geometry,mesh};s.holder.manager.getGeomFromInfo=()=>s.template;
+    // Material.clone() invokes new this.constructor() without arguments. The
+    // host's curve material requires a style argument and throws there, aborting
+    // its synchronous Pencil-up handler before input reset and render resume.
+    const material=new api.ShaderMaterial().copy(original.mesh.material);
+    for(const flag of ['isCurveMaterial','isCutoutMaterial','isSelectionMaterial'])if(flag in original.mesh.material)material[flag]=original.mesh.material[flag];
+    const mesh=new api.Mesh(geometry,material);mesh.matrixAutoUpdate=false;mesh.matrix.copy(original.mesh.matrix);mesh.castShadow=original.mesh.castShadow;mesh.receiveShadow=original.mesh.receiveShadow;
+    s.template={geometry,mesh};s.holder.manager.getGeomFromInfo=()=>s.template;s.retained=true;
   }
   function releaseRetained(s){
     if(!s||s.released||(s.owner&&!s.owner.detached))return;s.released=true;clearState(states.get(s.holder.manager));s.holder.manager.curveIdToGeomInfo.clear();

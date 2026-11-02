@@ -557,3 +557,15 @@ test('a native tile returned after Pencil-up is retained by the claimed document
  for(let i=0;i<400&&!f.store.get('late-tile')?.result;i++)await new Promise(r=>setTimeout(r,5));
  assert.ok(f.store.get('late-tile')?.result?.tiles?.length);assert.equal(f.pixelPackets.size,0);assert.equal(f.requests.filter(r=>r.streamBegin).length,1);assert.deepEqual(f.errors,[]);
 });
+
+test('Pencil-up retains host materials whose constructor requires brush settings',async()=>{
+ class RequiredSettingsMaterial extends THREE.ShaderMaterial {
+  constructor(settings){super();const {type}=settings;this.isCurveMaterial=true;this.defines.HOST_STYLE=type;this.vertexShader='void main(){gl_Position=vec4(position,1.0);}';this.fragmentShader='varying vec4 vColor;void main(){vec4 diffuseColor = vColor;gl_FragColor=diffuseColor;}';this.uniforms.testValue={value:17};}
+ }
+ const f=fixture(new Map(),null,null,{nativeStreaming:true,tilesOnly:true});f.manager.makeCurve('live',f.attributes);await settled();const {mesh}=f.manager.getGeomFromInfo(f.manager.curveIdToGeomInfo.get('live'));
+ mesh.material=new RequiredSettingsMaterial({type:'FLAT'});mesh.geometry.setDrawRange(0,6);f.fk.setBindings({RECT:'rect'});await f.fk.preview(mesh,{...f.attributes,sourceTemplate:true,strokeSlot:'0:0'});
+ assert.doesNotThrow(()=>f.fk.birth('required-ctor',f.attributes,'0:0'));
+ mesh.geometry.setDrawRange(0,0);f.fk.preview(mesh,{});f.manager.makeCurve('required-ctor',f.attributes);
+ for(let i=0;i<300&&!f.store.get('required-ctor')?.result?.tiles;i++)await new Promise(r=>setTimeout(r,5));
+ assert.ok(f.store.get('required-ctor')?.result?.tiles?.length);assert.deepEqual(f.errors,[]);assert.equal(f.streams.size,0);assert.equal(f.requests.filter(r=>r.streamFinish).length,1);
+});

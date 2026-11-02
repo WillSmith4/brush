@@ -83,6 +83,11 @@ The reusable Pencil mesh is released at handoff, and finished paint reads
 uniforms from its document curve instead of the next gesture's preview mesh.
 Concurrent host geometry pools share one finalization/save operation, preserving
 the original host-path baseline. Geometry serialization yields in short batches.
+Retaining a stroke copies the host material into a base ShaderMaterial. It must
+not call the host subclass's clone(): that method invokes its constructor without
+the required brush settings and aborts synchronous Pencil-up before the host
+clears its input or schedules renderer resume. The retained flag is set only
+after the copy and detached template have been constructed successfully.
 The host's final curve carries the live path/mirror slot explicitly: adjusting
 its first point no longer makes the adapter miss the existing native session.
 Native tiles arriving after Pencil-up are retained by the claimed curve rather
